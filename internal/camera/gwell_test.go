@@ -14,7 +14,7 @@ import (
 //   - TUTK: wyze:// — go2rtc dials the camera directly.
 //   - OG Gwell (LAN-direct): empty URL → publish-only slot that
 //     gwell-proxy RTSP-PUSHes into.
-//   - WebRTC (GW_BE1 / GW_DBD / no-LAN-IP Gwell): webrtc:…#format=wyze
+//   - WebRTC (GW_BE1 / GW_DBD): webrtc:…#format=wyze
 //     — go2rtc's native handler runs the KVS signaling dance itself.
 // When GWELL_ENABLED=false, OG Gwell cameras are filtered out in Discover;
 // WebRTC-streaming doorbells remain supported.
@@ -96,8 +96,8 @@ func TestManager_TUTKCamera_UsesAddStream(t *testing.T) {
 func TestManager_Discover_GwellFilter(t *testing.T) {
 	cameras := []wyzeapi.CameraInfo{
 		{Nickname: "V3", Model: "WYZE_CAKP2JFUS", MAC: "A1"},
-		{Nickname: "OG", Model: "GW_GC1", MAC: "A2", LanIP: "10.0.0.7"},
-		{Nickname: "Door", Model: "GW_BE1", MAC: "A3", LanIP: "10.0.0.8"},
+		{Nickname: "OG", Model: "GW_GC1", MAC: "A2"},
+		{Nickname: "Door", Model: "GW_BE1", MAC: "A3"},
 	}
 	logger := zerolog.Nop()
 
