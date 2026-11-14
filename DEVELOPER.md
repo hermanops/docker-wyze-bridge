@@ -41,6 +41,9 @@ If you prefer developing outside a container, you need:
 
 Download from [github.com/AlexxIT/go2rtc/releases](https://github.com/AlexxIT/go2rtc/releases/tag/v1.9.14) and place in the repo root:
 
+These commands do not verify download integrity. Independently verify the
+downloaded asset before running it.
+
 ```bash
 # Linux/macOS (amd64)
 curl -fsSL https://github.com/AlexxIT/go2rtc/releases/download/v1.9.14/go2rtc_linux_amd64 -o go2rtc
@@ -160,6 +163,95 @@ go test -v -run TestIntegration_Login ./internal/wyzeapi/
 CGO_ENABLED=1 go test -race ./...
 ```
 
+## Fork CI and releases
+
+Pull requests to `main` run Go tests, `go vet`, and an amd64 Docker build
+without registry credentials or image publication. External-fork PRs use the
+`pull_request` event, not `pull_request_target`; GitHub's fork approval and
+token restrictions still apply.
+
+Publishing is a separate, manual workflow. **Before enabling Actions or
+dispatching it**, configure these repository settings:
+
+1. Protect `main` with required PR reviews and CI checks, restrict who can
+   change workflows, and prevent administrators and automation from bypassing
+   those rules where available. `main` is currently unprotected.
+2. Create the `production` environment and restrict its deployment branches to
+   `main`. The sole release operator authorizes releases by manually dispatching
+   the workflow; independent reviewer approval is not required. GitHub may
+   otherwise create a referenced environment without protection.
+3. Add a nonempty random `PRODUCTION_RELEASE_ENABLED` as a **production
+   environment secret**, not a repository or organization secret. It provides
+   an additional fail-closed check if the environment is missing or recreated.
+   The workflow checks that the environment exists before the job can reference
+   it and again before publication; it does not verify its branch settings.
+   GHCR authentication uses the publish job's `GITHUB_TOKEN`.
+4. For automatic go2rtc update PRs, add `VERSION_CHECK_TOKEN` as a repository
+   secret. Use a fine-grained token scoped to this repository with contents and
+   pull-request write access, owned by a dedicated automation identity that
+   cannot bypass `main` protection. Rotate it and review its access regularly.
+   The updater pushes only its automation branch and opens a PR against `main`;
+   it never commits to `main`. Without this token an available update fails
+   explicitly. No `dev` branch is needed.
+
+After these settings are in place and the workflows are reviewed and enabled,
+dispatch **Publish bridge image** from the current `main` with a numeric
+`MAJOR.MINOR.PATCH` version. It builds amd64 and arm64 separately, produces a
+CycloneDX SBOM for each, and blocks on any CRITICAL vulnerability, including
+unfixed findings. The build jobs pass the archive SHA-256 and OCI manifest
+digest as workflow outputs only after the scan succeeds. After both scans
+succeed, the publish job verifies the downloaded archive hashes, copies the
+exact OCI manifests using Skopeo's `--preserve-digests`, verifies the registry
+digests, and creates the multi-architecture version tag in GHCR. It then
+inspects the index and fails unless it contains exactly the scanned
+linux/amd64 and linux/arm64 manifest digests. The index itself is assembled
+from the scanned manifests; it is not separately scanned. The job does not
+rebuild images. Per-run architecture tags are also pushed; a failure can
+leave published tags behind, so inspect GHCR if a run fails.
+The workflow serializes its publish jobs and checks the exact GHCR version
+manifest, refusing to publish unless the registry confirms it is missing.
+This check is not atomic against other registry writers; restrict package write
+access and do not publish the same tag outside this workflow.
+
+Candidate OCI archives and SBOMs are retained for 30 days, subject to the
+repository's artifact-retention limit. If artifacts expire before publication,
+dispatch a new run and scan again. The workflow does not publish `latest`,
+Home Assistant add-on images, or GitHub releases. No
+push, tag, PR, or scheduled event publishes images.
+
+The SBOMs are not currently attached to registry manifests, and the archive
+transfer does not preserve BuildKit provenance attestations. Before relying on
+these images for high-assurance deployments, add signed provenance and image
+signatures with verification by digest, and attach SBOMs to each published
+manifest. Base images, BuildKit, Skopeo, and action references are pinned by
+digest or commit; Buildx release binaries are checksum-verified. Alpine
+packages, GitHub-hosted runner images, and Trivy's vulnerability database
+remain mutable. Review changes and update pinned tool and image digests
+deliberately.
+
+These guarantees apply to the release image build, not the separate native and
+devcontainer setup. The manual go2rtc downloads above, `cycle.sh`, and the
+devcontainer's go2rtc and `video-rtc.js` downloads and base image are not
+checksum- or digest-verified; verify them separately before use.
+
+The Dockerfile verifies go2rtc release assets against SHA-256 values obtained
+from GitHub's release API. The 1.9.14 amd64 and arm64 hashes were also
+cross-checked with [Frigate's pinned checksums](https://github.com/blakeblackshear/frigate/blob/7fd81171f0b35bfe83086a5c28cc4e24db865034/docker/main/install_go2rtc.sh);
+all three supported Linux hashes were cross-checked with
+[petkit-local's pinned checksums](https://github.com/alex-so-3/petkit-local/blob/9f86e2213962f499ae8a8a507b433dc3da659124/addon/Dockerfile).
+`video-rtc.js` is verified against the hash of GitHub's content API response
+at the pinned release commit. The version-check workflow proposes updated
+pins from GitHub metadata in a PR; independently cross-check each update
+before merging. This release has no separate upstream checksum or signature
+file, so these checks do not prove publisher authenticity. Use upstream signed
+checksums when available.
+
+The image scan may not identify dependencies in the prebuilt go2rtc binary;
+assess upstream advisories and its own SBOM separately. Dependabot tracks Go
+modules, Actions, and Dockerfiles; review its updates and the Trivy version and
+digest together. Go module versions and checksums are recorded in `go.mod` and
+`go.sum`.
+
 ## Debugging
 
 ### Log levels
@@ -240,60 +332,3 @@ internal/
 1. Add the handler in `internal/webui/api.go`
 2. Register the route in `registerRoutes()` in `server.go`
 3. Add a test in `api_test.go` using `httptest`
-
-## Release Flow
-
-Two long-lived branches, two add-on channels.
-
-| Branch | HA add-on | Image tag | Who pushes |
-|--------|-----------|-----------|------------|
-| `dev`  | Wyze Bridge (Edge) | `-homeassistant-edge:{version}` where `{version}` is `X.Y.Z-edge.YYYYMMDD.HHMM` | developer merges land here |
-| `main` | Wyze Bridge (stable) | `-homeassistant:{version}` where `{version}` is the last semver tag | only tag-release commits + CI-driven edge config bumps |
-
-### Daily edge flow
-
-1. Commit to `dev` (directly or via PR).
-2. CI builds the bridge image + edge add-on image and pushes both. The
-   edge image is tagged with a timestamped version
-   (`X.Y.Z-edge.YYYYMMDD.HHMM`).
-3. CI's `addon-edge` job clones `main`, bumps
-   `home_assistant/wyze_bridge_edge/config.yaml` `version:` to the same
-   timestamped string, and commits directly to `main`.
-4. HA users on the edge channel see an "update available" within
-   minutes.
-
-The base of the edge version (`X.Y.Z-edge`, the part before the
-timestamp) lives in `home_assistant/wyze_bridge_edge/config.yaml` on
-`dev`. Bump it there when you start a new minor cycle (e.g.
-`4.3.0-edge`); CI strips any existing `.YYYYMMDD.HHMM` suffix before
-appending the current timestamp so you never get compounding suffixes.
-
-### Promoting an edge release to stable
-
-When `dev` is ready to become the new stable:
-
-```bash
-# 1. Open the release PR
-gh pr create --base main --head dev \
-  --title "Release v4.2.0" \
-  --body "## Changes since 4.1.0\n\n- ..."
-
-# 2. Review + merge the PR in the GitHub UI or via
-gh pr merge --merge   # or --squash if you prefer linear history on main
-
-# 3. Tag the release on main
-git checkout main && git pull
-git tag v4.2.0
-git push origin v4.2.0
-```
-
-The tag push triggers CI's `version-bump` job, which rewrites
-`home_assistant/wyze_bridge/config.yaml` `version:` to `4.2.0` and
-commits it back to `main`. The stable add-on image is published with
-that tag.
-
-**Conflict note:** PR merges rarely conflict on
-`home_assistant/wyze_bridge_edge/config.yaml` because `dev` doesn't
-touch the timestamped suffix — CI only bumps it on `main`. If a
-conflict does appear, take `main`'s (timestamped) version; the merge
-commit should leave `dev`'s base edge version intact otherwise.

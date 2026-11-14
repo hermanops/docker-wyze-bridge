@@ -2,49 +2,119 @@ name: Version Check
 
 on:
   schedule:
-    - cron: '0 0 * * 1' # weekly on Monday
+    - cron: '0 0 * * 1'
   workflow_dispatch:
+
+permissions:
+  contents: read
 
 jobs:
   update-go2rtc:
-    runs-on: ubuntu-latest
-
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: main
+          persist-credentials: false
 
-      - name: Get latest go2rtc release
+      - name: Check latest stable go2rtc version
         id: go2rtc
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
         run: |
-          latest=$(curl -s https://api.github.com/repos/AlexxIT/go2rtc/releases/latest | jq -r '.tag_name' | sed 's/^v//')
-          if [[ ! $latest =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-            echo "Invalid version: ${latest}"
+          set -euo pipefail
+          release=$(curl -fsSL --retry 3 https://api.github.com/repos/AlexxIT/go2rtc/releases/latest)
+          latest=$(jq -er 'select(.draft == false and .prerelease == false) |
+            .tag_name | select(type == "string" and test("^v[0-9]+\\.[0-9]+\\.[0-9]+$")) |
+            ltrimstr("v")' <<<"$release")
+          if [[ $(grep -c '^ARG GO2RTC_VERSION=' docker/Dockerfile) != 1 ]]; then
+            echo "::error::Dockerfile must contain exactly one GO2RTC_VERSION argument"
             exit 1
           fi
-          current=$(grep 'GO2RTC_VERSION=' docker/Dockerfile | head -1 | sed 's/.*GO2RTC_VERSION=//' | tr -d ' ')
-          echo "latest=$latest" >> $GITHUB_OUTPUT
-          echo "current=$current" >> $GITHUB_OUTPUT
+          current=$(sed -n 's/^ARG GO2RTC_VERSION=\([0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*\)$/\1/p' docker/Dockerfile)
+          if [[ ! $current =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::Dockerfile must contain exactly one numeric GO2RTC_VERSION"
+            exit 1
+          fi
+          if [[ $(printf '%s\n%s\n' "$latest" "$current" | sort -V | head -n 1) != "$current" ]]; then
+            echo "::error::Latest release is older than the configured version"
+            exit 1
+          fi
+          echo "latest=$latest" >> "$GITHUB_OUTPUT"
+          echo "current=$current" >> "$GITHUB_OUTPUT"
+          if [[ "$latest" == "$current" ]]; then
+            exit 0
+          fi
+
+          for arch in amd64 arm64 arm; do
+            digest=$(jq -er --arg name "go2rtc_linux_$arch" '
+              [.assets[] | select(.name == $name and .state == "uploaded") |
+               .digest | select(type == "string" and test("^sha256:[0-9a-f]{64}$"))] |
+              if length == 1 then .[0] | ltrimstr("sha256:") else error("missing or duplicate asset digest") end' <<<"$release")
+            echo "${arch}_sha256=$digest" >> "$GITHUB_OUTPUT"
+          done
+          ref=$(gh api "repos/AlexxIT/go2rtc/git/ref/tags/v$latest")
+          for _ in 1 2 3 4 5; do
+            type=$(jq -er '.object.type' <<<"$ref")
+            commit=$(jq -er '.object.sha | select(test("^[0-9a-f]{40}$"))' <<<"$ref")
+            if [[ "$type" == commit ]]; then
+              break
+            fi
+            if [[ "$type" != tag ]]; then
+              echo "::error::Release tag does not reference a commit"
+              exit 1
+            fi
+            ref=$(gh api "repos/AlexxIT/go2rtc/git/tags/$commit")
+          done
+          if [[ "$type" != commit ]]; then
+            echo "::error::Release tag nesting exceeds the supported limit"
+            exit 1
+          fi
+          source=$(gh api "repos/AlexxIT/go2rtc/contents/www/video-rtc.js?ref=$commit")
+          content=$(jq -er 'select(.type == "file" and .encoding == "base64") |
+            .content | select(type == "string" and length > 0)' <<<"$source")
+          video_sha=$(printf '%s' "$content" | base64 -d | sha256sum | cut -d ' ' -f 1)
+          echo "commit=$commit" >> "$GITHUB_OUTPUT"
+          echo "video_sha256=$video_sha" >> "$GITHUB_OUTPUT"
 
       - name: Update go2rtc version
         if: steps.go2rtc.outputs.current != steps.go2rtc.outputs.latest
+        env:
+          LATEST_VERSION: ${{ steps.go2rtc.outputs.latest }}
+          GO2RTC_COMMIT: ${{ steps.go2rtc.outputs.commit }}
+          GO2RTC_SHA256_AMD64: ${{ steps.go2rtc.outputs.amd64_sha256 }}
+          GO2RTC_SHA256_ARM64: ${{ steps.go2rtc.outputs.arm64_sha256 }}
+          GO2RTC_SHA256_ARM: ${{ steps.go2rtc.outputs.arm_sha256 }}
+          VIDEO_RTC_SHA256: ${{ steps.go2rtc.outputs.video_sha256 }}
         run: |
-          sed -i "s/GO2RTC_VERSION=.*/GO2RTC_VERSION=${{ steps.go2rtc.outputs.latest }}/" docker/Dockerfile
+          set -euo pipefail
+          sed -i "s/^ARG GO2RTC_VERSION=.*/ARG GO2RTC_VERSION=$LATEST_VERSION/" docker/Dockerfile
+          for field in GO2RTC_COMMIT GO2RTC_SHA256_AMD64 GO2RTC_SHA256_ARM64 GO2RTC_SHA256_ARM VIDEO_RTC_SHA256; do
+            if [[ $(grep -c "^ENV $field=" docker/Dockerfile) != 1 ]]; then
+              echo "::error::Dockerfile must contain exactly one $field"
+              exit 1
+            fi
+            value=$(printenv "$field")
+            if [[ ! "$value" =~ ^[0-9a-f]{40}$ && ! "$value" =~ ^[0-9a-f]{64}$ ]]; then
+              echo "::error::Invalid value for $field"
+              exit 1
+            fi
+            sed -i "s/^ENV $field=.*/ENV $field=$value/" docker/Dockerfile
+          done
 
-      - name: Create Pull Request
+      - name: Create dependency update pull request
         if: steps.go2rtc.outputs.current != steps.go2rtc.outputs.latest
-        uses: peter-evans/create-pull-request@v7
+        uses: peter-evans/create-pull-request@22a9089034f40e5a961c8808d113e2c98fb63676 # v7
         with:
+          token: ${{ secrets.VERSION_CHECK_TOKEN }}
           title: 'Bump go2rtc to v${{ steps.go2rtc.outputs.latest }}'
-          commit-message: 'deps: update go2rtc from v${{ steps.go2rtc.outputs.current }} to v${{ steps.go2rtc.outputs.latest }}'
-          branch: go2rtc-version
+          commit-message: 'deps: update go2rtc to v${{ steps.go2rtc.outputs.latest }}'
+          branch: automation/go2rtc-version
+          base: main
           body: |
-            Updates go2rtc to [v${{ steps.go2rtc.outputs.latest }}](https://github.com/AlexxIT/go2rtc/releases/tag/v${{ steps.go2rtc.outputs.latest }}).
-
-            **Test checklist:**
-            - [ ] Cameras connect and stream
-            - [ ] WebRTC player works
-            - [ ] RTSP output works
-          add-paths: |
-            docker/Dockerfile
-          base: dev
+            Updates go2rtc from v${{ steps.go2rtc.outputs.current }} to
+            [v${{ steps.go2rtc.outputs.latest }}](https://github.com/AlexxIT/go2rtc/releases/tag/v${{ steps.go2rtc.outputs.latest }}).
+          add-paths: docker/Dockerfile
           delete-branch: true
-

@@ -9,27 +9,27 @@ import (
 
 // ModelNames maps product_model codes to human-readable names.
 var ModelNames = map[string]string{
-	"WYZEC1":        "V1",
-	"WYZEC1-JZ":     "V2",
+	"WYZEC1":         "V1",
+	"WYZEC1-JZ":      "V2",
 	"WYZE_CAKP2JFUS": "V3",
-	"HL_CAM4":       "V4",
-	"HL_CAM3P":      "V3 Pro",
-	"WYZECP1_JEF":   "Pan",
-	"HL_PAN2":       "Pan V2",
-	"HL_PAN3":       "Pan V3",
-	"HL_PANP":       "Pan Pro",
-	"HL_CFL2":       "Floodlight V2",
-	"WYZEDB3":       "Doorbell",
-	"HL_DB2":        "Doorbell V2",
-	"GW_BE1":        "Doorbell Pro",
-	"AN_RDB1":       "Doorbell Pro 2",
-	"GW_GC1":        "OG",
-	"GW_GC2":        "OG 3X",
-	"WVOD1":         "Outdoor",
-	"HL_WCO2":       "Outdoor V2",
-	"AN_RSCW":       "Battery Cam Pro",
-	"LD_CFP":        "Floodlight Pro",
-	"GW_DBD":        "Doorbell Duo",
+	"HL_CAM4":        "V4",
+	"HL_CAM3P":       "V3 Pro",
+	"WYZECP1_JEF":    "Pan",
+	"HL_PAN2":        "Pan V2",
+	"HL_PAN3":        "Pan V3",
+	"HL_PANP":        "Pan Pro",
+	"HL_CFL2":        "Floodlight V2",
+	"WYZEDB3":        "Doorbell",
+	"HL_DB2":         "Doorbell V2",
+	"GW_BE1":         "Doorbell Pro",
+	"AN_RDB1":        "Doorbell Pro 2",
+	"GW_GC1":         "OG",
+	"GW_GC2":         "OG 3X",
+	"WVOD1":          "Outdoor",
+	"HL_WCO2":        "Outdoor V2",
+	"AN_RSCW":        "Battery Cam Pro",
+	"LD_CFP":         "Floodlight Pro",
+	"GW_DBD":         "Doorbell Duo",
 }
 
 // Gwell-protocol cameras (not supported by go2rtc TUTK).
@@ -88,19 +88,11 @@ func (c CameraInfo) IsGwell() bool {
 }
 
 // IsWebRTCStreamer returns true when this camera streams via Wyze's
-// WebRTC path (served by go2rtc's native #format=wyze source). True if
-// either the model is in the allow-list OR the camera is Gwell-protocol
-// but has no LAN IP — the cloud not reporting a LAN IP is a reliable
-// signal for the doorbell lineage. OG cameras (LAN-direct Gwell P2P)
-// always have a LAN IP and stay on gwell-proxy.
+// WebRTC path (served by go2rtc's native #format=wyze source). Gwell
+// cameras are classified by model because Wyze omits LAN IPs for both
+// doorbell-lineage and OG cameras.
 func (c CameraInfo) IsWebRTCStreamer() bool {
-	if webRTCStreamerModels[c.Model] {
-		return true
-	}
-	if c.IsGwell() && (c.LanIP == "" || c.LanIP == "0.0.0.0") {
-		return true
-	}
-	return false
+	return webRTCStreamerModels[c.Model]
 }
 
 // IsPanCam returns true if this is a pan/tilt camera.

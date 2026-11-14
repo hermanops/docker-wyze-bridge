@@ -5,7 +5,6 @@ import (
 	"context"
 	"fmt"
 	"io"
-	"os"
 	"os/exec"
 	"strconv"
 	"strings"
@@ -21,29 +20,11 @@ import (
 // cameras via our /internal/wyze shim and RTSP-PUSHes their H.264 to
 // go2rtc. If ctx is cancelled (shutdown), the subprocess dies with us.
 //
-// No-op design: if cfg.GwellBinary is set, use it; otherwise look in
-// PATH for "gwell-proxy". If nothing found, log once and return —
-// there's no value in spamming reconnect attempts when the binary is
-// simply not shipped (e.g. during local dev before a container rebuild).
+// The binary is resolved before discovery, so missing proxy support
+// cannot leave OG cameras registered with empty publish-only streams.
 func spawnGwellProxy(ctx context.Context, cfg *config.Config, log zerolog.Logger) {
-	bin := cfg.GwellBinary
-	if bin == "" {
-		if resolved, err := exec.LookPath("gwell-proxy"); err == nil {
-			bin = resolved
-		} else {
-			// Fallback: the Docker image installs at a fixed path; try it
-			// before giving up so users running without the PATH entry
-			// (e.g. minimal systemd envs) still work.
-			for _, candidate := range []string{"/usr/local/bin/gwell-proxy", "./gwell-proxy", "./gwell-proxy.exe"} {
-				if _, err := os.Stat(candidate); err == nil {
-					bin = candidate
-					break
-				}
-			}
-		}
-	}
-	if bin == "" {
-		log.Warn().Msg("gwell-proxy binary not found; GW_ cameras will not stream. Set GWELL_BINARY or put gwell-proxy on PATH.")
+	if cfg.GwellBinary == "" {
+		log.Warn().Msg("gwell-proxy binary not found; OG Gwell cameras will not stream. Set GWELL_BINARY or put gwell-proxy on PATH.")
 		return
 	}
 
@@ -75,7 +56,7 @@ func spawnGwellProxy(ctx context.Context, cfg *config.Config, log zerolog.Logger
 	const maxBackoff = 60 * time.Second
 
 	for ctx.Err() == nil {
-		if err := runGwellProxyOnce(ctx, bin, shimURL, rtspHost, rtspPort, dumpDir, ffmpegLogLevel, deadmanTimeout, log); err != nil {
+		if err := runGwellProxyOnce(ctx, cfg.GwellBinary, shimURL, rtspHost, rtspPort, dumpDir, ffmpegLogLevel, deadmanTimeout, log); err != nil {
 			log.Warn().Err(err).Dur("backoff", backoff).Msg("gwell-proxy exited; restarting")
 		}
 		if ctx.Err() != nil {
@@ -90,6 +71,35 @@ func spawnGwellProxy(ctx context.Context, cfg *config.Config, log zerolog.Logger
 		if backoff > maxBackoff {
 			backoff = maxBackoff
 		}
+	}
+}
+
+func findGwellBinary(configured string) string {
+	if configured != "" {
+		if resolved, err := exec.LookPath(configured); err == nil {
+			return resolved
+		}
+		return ""
+	}
+	if resolved, err := exec.LookPath("gwell-proxy"); err == nil {
+		return resolved
+	}
+	for _, candidate := range []string{"/usr/local/bin/gwell-proxy", "./gwell-proxy", "./gwell-proxy.exe"} {
+		if resolved, err := exec.LookPath(candidate); err == nil {
+			return resolved
+		}
+	}
+	return ""
+}
+
+func configureGwellProxy(cfg *config.Config, log zerolog.Logger) {
+	if !cfg.GwellEnabled {
+		return
+	}
+	cfg.GwellBinary = findGwellBinary(cfg.GwellBinary)
+	if cfg.GwellBinary == "" {
+		cfg.GwellEnabled = false
+		log.Warn().Msg("gwell-proxy binary not found; OG Gwell cameras will be skipped. Set GWELL_BINARY or put gwell-proxy on PATH.")
 	}
 }
 

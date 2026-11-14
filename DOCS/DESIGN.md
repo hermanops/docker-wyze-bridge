@@ -18,7 +18,7 @@ Three streaming paths, chosen per-camera from the model ID:
 | Path | Used for | How |
 | ---- | -------- | --- |
 | **TUTK** | Most models (V1, V2, V3, V3 Pro, V4, Doorbell v2, Pan V1/V2/V3/Pro, Floodlight v1/v2, Outdoor v1/v2) | go2rtc's built-in `wyze://` source speaks Wyze's pure-Go TUTK P2P. LAN-direct UDP; no binary SDK. |
-| **Gwell P2P** | OG family (`GW_GC1`, `GW_GC2`) | `gwell-proxy` sidecar handles the Gwell/IoTVideo handshake and RTSP-PUBLISH-es H.264 into go2rtc. |
+| **Gwell P2P** | OG family (`GW_GC1`, `GW_GC2`) | Optional, disabled by default. A user-supplied `gwell-proxy` executable handles the Gwell/IoTVideo handshake and RTSP-PUBLISH-es H.264 into go2rtc; it is not included in the standard image. |
 | **WebRTC (KVS)** | Doorbell lineage (`GW_BE1` Doorbell Pro, `GW_DBD` Doorbell Duo) | go2rtc's native `#format=wyze` source fetches the signaling URL + ICE servers from our loopback shim (`/internal/wyze/webrtc/<cam>`, which calls Wyze's `/v4/camera/get_streams`) and dials `wyze-mars-webcsrv.wyzecam.com` itself. No sidecar. |
 
 The bridge orchestrates: Wyze API auth, camera discovery, go2rtc
@@ -84,23 +84,30 @@ Docker Container
 │   └── Config               — env vars, config.yml, Docker secrets
 ├── go2rtc (managed subprocess)
 │   ├── wyze://    source    — pure-Go TUTK P2P
-│   ├── rtsp:      source    — receives publishes from gwell-proxy (for OG cameras)
+│   ├── rtsp:      source    — receives optional Gwell proxy publishes (for OG cameras)
 │   ├── webrtc:    source    — native Wyze KVS handler (for doorbell lineage)
 │   ├── RTSP       :8554     — consumer endpoint; also where recording ffmpegs pull from
 │   ├── WebRTC     :8889 / :8189 UDP
 │   ├── HLS        :8888
 │   └── API / UI   :1984     — control plane; also the only interface the bridge talks to go2rtc through
-└── gwell-proxy (subprocess — spawned only when an OG camera is discovered)
+└── optional user-supplied gwell-proxy executable
+    (not included in the image; enabled with GWELL_ENABLED=true)
     └── Gwell P2P → ffmpeg → RTSP PUBLISH into go2rtc
 ```
+
+The bridge starts the proxy when `GWELL_ENABLED=true` and a compatible
+executable is available through `GWELL_BINARY` or `PATH`. It polls the
+shim for OG cameras discovered at startup or later.
 
 ### 4.2 Subprocess strategy
 
 go2rtc is a separate process because its `internal/` packages aren't
-importable and its HTTP API is stable. `gwell-proxy` is a separate
-process because we vendor `github.com/wlatic/hacky-wyze-gwell` as
-its own Go module (its `go.mod` path doesn't match its repo URL, so
-it can't be `go get`'d) and because it owns ffmpeg per OG camera.
+importable and its HTTP API is stable. When enabled, `gwell-proxy` is a
+separate process supplied by the user; the standard image does not
+include its executable. The repository vendors
+`github.com/wlatic/hacky-wyze-gwell` as its own Go module (its `go.mod`
+path doesn't match its repo URL, so it can't be `go get`'d), and the
+proxy owns ffmpeg per OG camera.
 
 Every interaction with go2rtc is through `http://127.0.0.1:1984/api/`.
 The bridge writes a skeletal YAML at startup (listener ports, auth,
@@ -904,7 +911,7 @@ Camera-specific log lines include `Str("cam", name)` for easy filtering.
 ```ascii
 cmd/
 ├── wyze-bridge/               main binary — DI wiring, signal handling, shutdown
-└── gwell-proxy/               OG Gwell P2P sidecar binary
+└── gwell-proxy/               optional OG Gwell P2P binary source
 
 internal/
 ├── wyzeapi/                   Wyze cloud API: auth, discovery, commands, Mars,
@@ -948,8 +955,10 @@ README.md                      landing page
 ## 8. Dockerfile
 
 Three-stage Alpine build: fetch go2rtc release binary + `video-rtc.js`,
-build our two Go binaries (`wyze-bridge`, `gwell-proxy`), then assemble
-a runtime image with ffmpeg bundled. Multi-arch via `TARGETARCH`
+build `wyze-bridge`, then assemble a runtime image with ffmpeg bundled.
+The standard image does not build or copy `gwell-proxy`; OG streaming
+requires enabling `GWELL_ENABLED` and supplying a compatible binary
+through `GWELL_BINARY` or `PATH`. Multi-arch via `TARGETARCH`
 (`amd64`, `arm64`, `arm/v7`). The pinned `GO2RTC_VERSION` ARG is the
 single source of truth — `cycle.sh` greps it out so local dev
 downloads the matching release. See `docker/Dockerfile` for the

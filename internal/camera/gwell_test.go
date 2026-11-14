@@ -4,7 +4,8 @@ import (
 	"context"
 	"testing"
 
-	"github.com/IDisposable/docker-wyze-bridge/internal/config"
+	"github.com/rs/zerolog"
+
 	"github.com/IDisposable/docker-wyze-bridge/internal/wyzeapi"
 )
 
@@ -13,10 +14,10 @@ import (
 //   - TUTK: wyze:// — go2rtc dials the camera directly.
 //   - OG Gwell (LAN-direct): empty URL → publish-only slot that
 //     gwell-proxy RTSP-PUSHes into.
-//   - WebRTC (GW_BE1 / GW_DBD / no-LAN-IP Gwell): webrtc:…#format=wyze
+//   - WebRTC (GW_BE1 / GW_DBD): webrtc:…#format=wyze
 //     — go2rtc's native handler runs the KVS signaling dance itself.
-// When GWELL_ENABLED=false, Gwell cameras are filtered out in Discover
-// so they never enter the registry.
+// When GWELL_ENABLED=false, OG Gwell cameras are filtered out in Discover;
+// WebRTC-streaming doorbells remain supported.
 
 func TestManager_GwellOGCamera_RegistersPublishOnlySlot(t *testing.T) {
 	mgr, go2rtcAPI := newTestManager(t)
@@ -93,40 +94,23 @@ func TestManager_TUTKCamera_UsesAddStream(t *testing.T) {
 }
 
 func TestManager_Discover_GwellFilter(t *testing.T) {
-	// The filter loop inside Discover() — tested here against the
-	// cfg.GwellEnabled flag directly, without spinning a live Wyze
-	// API mock.
 	cameras := []wyzeapi.CameraInfo{
 		{Nickname: "V3", Model: "WYZE_CAKP2JFUS", MAC: "A1"},
 		{Nickname: "OG", Model: "GW_GC1", MAC: "A2"},
 		{Nickname: "Door", Model: "GW_BE1", MAC: "A3"},
 	}
+	logger := zerolog.Nop()
 
-	t.Run("disabled: Gwell filtered", func(t *testing.T) {
-		cfg := &config.Config{GwellEnabled: false}
-		if got := applyGwellFilter(cfg, cameras); len(got) != 1 || got[0].Model != "WYZE_CAKP2JFUS" {
-			t.Errorf("got %+v, want only TUTK", got)
+	t.Run("disabled: OG proxy camera filtered", func(t *testing.T) {
+		got := filterGwellCameras(cameras, false, logger)
+		if len(got) != 2 || got[0].Model != "WYZE_CAKP2JFUS" || got[1].Model != "GW_BE1" {
+			t.Errorf("got %+v, want TUTK and WebRTC doorbell", got)
 		}
 	})
 
 	t.Run("enabled: Gwell included", func(t *testing.T) {
-		cfg := &config.Config{GwellEnabled: true}
-		if got := applyGwellFilter(cfg, cameras); len(got) != 3 {
+		if got := filterGwellCameras(cameras, true, logger); len(got) != 3 {
 			t.Errorf("want all 3, got %d: %+v", len(got), got)
 		}
 	})
-}
-
-// applyGwellFilter mirrors the filter loop in Manager.Discover so we
-// can unit-test the decision without a live HTTP Wyze API. Keep in
-// sync with manager.go's Discover.
-func applyGwellFilter(cfg *config.Config, cameras []wyzeapi.CameraInfo) []wyzeapi.CameraInfo {
-	var supported []wyzeapi.CameraInfo
-	for _, cam := range cameras {
-		if cam.IsGwell() && !cfg.GwellEnabled {
-			continue
-		}
-		supported = append(supported, cam)
-	}
-	return supported
 }

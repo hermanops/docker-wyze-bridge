@@ -68,19 +68,19 @@ func TestShim_CameraList_ExcludesWebRTCStreamers(t *testing.T) {
 		Name: "front_door", Model: "GW_BE1", MAC: "AABBCC001122", LanIP: "",
 	}, "hd", true, false)
 	srv.camMgr.InjectCamera("front_door", webrtcByModel)
-	// GW_GC1 with no LAN IP: WebRTC by heuristic.
-	webrtcByHeuristic := camera.NewCamera(wyzeapi.CameraInfo{
+	// OG camera with no LAN IP: the Gwell proxy discovers its address.
+	ogWithoutLANIP := camera.NewCamera(wyzeapi.CameraInfo{
 		Name: "mystery_og", Model: "GW_GC1", MAC: "DDEEFF001122", LanIP: "",
 	}, "hd", true, false)
-	srv.camMgr.InjectCamera("mystery_og", webrtcByHeuristic)
+	srv.camMgr.InjectCamera("mystery_og", ogWithoutLANIP)
 
 	w := httptest.NewRecorder()
 	srv.handleShimCameraList(w, newShimReq("GET", "/internal/wyze/Camera/CameraList"))
 
 	var got []string
 	_ = json.NewDecoder(w.Body).Decode(&got)
-	if len(got) != 0 {
-		t.Errorf("expected empty list (both WebRTC-routed), got %v", got)
+	if len(got) != 1 || got[0] != "DDEEFF001122" {
+		t.Errorf("want the OG camera for proxy discovery, got %v", got)
 	}
 }
 

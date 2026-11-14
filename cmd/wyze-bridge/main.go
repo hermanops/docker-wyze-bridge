@@ -40,6 +40,8 @@ func main() {
 	// Initialize logging
 	initLogging(cfg)
 
+	configureGwellProxy(cfg, log.Logger)
+
 	log.Info().
 		Str("version", Version).
 		Str("log_level", cfg.LogLevel.String()).
@@ -123,10 +125,9 @@ func main() {
 	camMgr.SetGo2RTCAPI(go2rtcAPI)
 	webServer.SetGo2RTCAPI(go2rtcAPI)
 
-	// Spawn gwell-proxy sidecar now that the shim is listening and
-	// go2rtc's RTSP server is accepting publishes into the reserved
-	// Gwell slots.
-	gwellProxy := startGwellProxyIfEnabled(ctx, cfg, camMgr)
+	// Start gwell-proxy after the shim and go2rtc are ready. It polls
+	// the shim for OG cameras discovered now or later.
+	gwellProxy := startGwellProxyIfEnabled(ctx, cfg)
 
 	mqttClient := setupMQTT(cfg, camMgr, apiClient)
 	webhookClient := setupWebhooks(cfg)
@@ -268,29 +269,15 @@ type gwellProxyHandle struct {
 	done   chan struct{}
 }
 
-func startGwellProxyIfEnabled(ctx context.Context, cfg *config.Config, camMgr *camera.Manager) *gwellProxyHandle {
+func startGwellProxyIfEnabled(ctx context.Context, cfg *config.Config) *gwellProxyHandle {
 	if !cfg.GwellEnabled {
-		log.Info().Msg("GWELL_ENABLED=false; GW_ cameras will be skipped")
-		return nil
-	}
-	// Only spawn if there's at least one OG-style Gwell camera (IsGwell
-	// and LAN-reachable). WebRTC-streamer cameras go to go2rtc's native
-	// #format=wyze handler — gwell-proxy would just poll the shim and
-	// log "0 Gwell cameras, retrying in 30s" forever.
-	hasOG := false
-	for _, cam := range camMgr.Cameras() {
-		info := cam.GetInfo()
-		if info.IsGwell() && !info.IsWebRTCStreamer() {
-			hasOG = true
-			break
-		}
-	}
-	if !hasOG {
-		log.Info().Msg("GWELL_ENABLED=true but no OG-style Gwell cameras discovered; skipping gwell-proxy")
+		log.Info().Msg("Gwell streaming disabled; OG Gwell cameras will be skipped")
 		return nil
 	}
 
-	log.Info().Msg("GWELL_ENABLED=true; spawning gwell-proxy")
+	// The proxy polls the shim for cameras, so starting it now also
+	// covers external-go2rtc mode and cameras found by later discovery.
+	log.Info().Msg("GWELL_ENABLED=true; starting gwell-proxy")
 	proxyCtx, proxyCancel := context.WithCancel(ctx)
 	handle := &gwellProxyHandle{
 		cancel: proxyCancel,

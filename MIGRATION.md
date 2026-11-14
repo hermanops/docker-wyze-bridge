@@ -5,13 +5,14 @@ This guide is for existing `docker-wyze-bridge` users upgrading from the Python-
 ## Quick Start
 
 Change your Docker image and you're done. All core environment variables are the same.
+Replace `VERSION` with a published numeric release tag.
 
 ```yaml
 # Before (Python)
-image: idisposablegithub365/wyze-bridge:latest
+image: <your-current-python-image>
 
 # After (Go rewrite)
-image: idisposablegithub365/wyze-bridge:go
+image: ghcr.io/hermanops/docker-wyze-bridge:VERSION
 ```
 
 ## What Works the Same
@@ -172,9 +173,10 @@ Previously unsupported in the Python bridge, now handled in two ways:
 
 - **OG family** (`GW_GC1`, `GW_GC2`) — `gwell-proxy` sidecar speaks
   Gwell P2P directly (LAN-direct UDP) and republishes to go2rtc via
-  RTSP. Enabled by default; the sidecar only spawns when an OG camera
-  is actually discovered, so users without OG cameras pay zero cost.
-  Set `GWELL_ENABLED=false` to opt out.
+  RTSP. Disabled by default because the standard runtime image does not
+  include the proxy. Enable with `GWELL_ENABLED=true` and provide a
+  compatible executable via `GWELL_BINARY` or `PATH`; OG cameras are
+  skipped if the proxy is unavailable.
 - **Doorbell lineage** (`GW_BE1` Doorbell Pro, `GW_DBD` Doorbell Duo)
   — go2rtc's native `#format=wyze` source dials Wyze's
   `wyze-mars-webcsrv.wyzecam.com` WebRTC signaling server itself; our
@@ -193,7 +195,7 @@ rely on an earlier behavior, set the env var explicitly.
 
 | Variable | 3.x default | 4.0 default | Reason |
 | -------- | ----------- | ----------- | ------ |
-| `GWELL_ENABLED` | n/a (Gwell cameras unsupported) | `true` | Zero cost when no OG camera is present; enables doorbell OGs out-of-the-box |
+| `GWELL_ENABLED` | n/a (Gwell cameras unsupported) | `false` | The standard runtime image does not include gwell-proxy; OG support requires an explicit opt-in and compatible binary |
 | `SNAPSHOT_PATH` | `/img` (flat, one overwritten JPEG per camera) | `/media/snapshots/{cam_name}/%Y-%m-%d` (time-lapse archive) | Consumers that need "latest frame" should query `/api/snapshot/<cam>` — filesystem archive is more useful for most users |
 | `SNAPSHOT_FILE_NAME` | n/a (filename fixed) | `%H-%M-%S` | Time-of-day stems, date comes from the path |
 | `RECORD_PATH` | `/record/{cam_name}/%Y/%m/%d` | `/media/recordings/{cam_name}/%Y/%m/%d` | Consolidated under a single `/media` volume mount |
