@@ -7,7 +7,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 Docker Wyze Bridge is a Go application that bridges Wyze cameras to standard streaming protocols (WebRTC/RTSP/HLS). Three streaming paths, picked per-camera:
 
 - **TUTK** (most of the fleet): go2rtc connects directly via its `wyze://` source.
-- **Gwell P2P** (OG: `GW_GC1`, `GW_GC2`): optional `gwell-proxy` sidecar handles the LAN-direct UDP P2P and republishes to go2rtc as loopback RTSP.
+- **Gwell P2P** (OG: `GW_GC1`, `GW_GC2`): optional, disabled by default. A user-supplied `gwell-proxy` executable handles LAN-direct UDP P2P and republishes to go2rtc as loopback RTSP; it is not included in the standard image.
 - **WebRTC (KVS)** (doorbell lineage: `GW_BE1` Doorbell Pro, `GW_DBD` Doorbell Duo): go2rtc's native `#format=wyze` source pulls the Wyze KVS signaling URL + ICE servers from our loopback shim at `/internal/wyze/webrtc/<cam>` and dials Wyze's `wyze-mars-webcsrv.wyzecam.com` itself. **No sidecar.**
 
 No Python, no binary SDK. FFmpeg is bundled solely for go2rtc's JPEG snapshot endpoint; the bridge itself never invokes it.
@@ -46,11 +46,16 @@ docker buildx build -f docker/Dockerfile -t wyze-bridge .
 Docker Container
 ├── wyze-bridge (Go binary — our code, port 5080)
 ├── go2rtc      (managed sidecar — ports 1984, 8554, 8888, 8889, 8189/udp)
-└── gwell-proxy (optional sidecar — only spawned when an OG-family
-                 Gwell camera is discovered; loopback RTSP + control API)
+└── optional user-supplied gwell-proxy executable
+    (not included in the image; started when GWELL_ENABLED=true)
 ```
 
-go2rtc handles all TUTK cameras and all WebRTC (doorbell-lineage) cameras. For OG-family Gwell cameras (LAN-direct UDP P2P), the `gwell-proxy` sidecar (vendored from `github.com/wlatic/hacky-wyze-gwell`) handles the handshake and republishes as a loopback RTSP stream feeding go2rtc like any other source. Our Go binary orchestrates: Wyze API auth, camera discovery, go2rtc config generation, the `/internal/wyze/webrtc/<cam>` shim that feeds go2rtc's `#format=wyze` source, MQTT, WebUI, snapshots, recording config, and state persistence.
+go2rtc handles all TUTK cameras and all WebRTC (doorbell-lineage) cameras. For OG-family Gwell cameras (LAN-direct UDP P2P), a user-supplied `gwell-proxy` executable (built from the vendored `github.com/wlatic/hacky-wyze-gwell` source) handles the handshake and republishes as a loopback RTSP stream feeding go2rtc. Our Go binary orchestrates: Wyze API auth, camera discovery, go2rtc config generation, the `/internal/wyze/webrtc/<cam>` shim that feeds go2rtc's `#format=wyze` source, MQTT, WebUI, snapshots, recording config, and state persistence.
+
+The standard Docker image does not include `gwell-proxy`. To enable OG
+streaming, set `GWELL_ENABLED=true` and provide a compatible executable
+through `GWELL_BINARY` or `PATH`; the proxy waits for cameras discovered
+at startup or later.
 
 ### Entry Point
 
@@ -98,8 +103,9 @@ All env vars documented in `DOCS/DESIGN.md` section 5.8. Key ones:
 - `LOG_LEVEL` — trace/debug/info/warn/error
 - `FORCE_IOTC_DETAIL` — verbose go2rtc + bridge logging
 - `WEBHOOK_URLS` — comma-separated URLs for state change notifications
-- `GWELL_ENABLED` — master switch for Gwell protocol proxy (default `true`)
-- `GWELL_BINARY` / `GWELL_RTSP_PORT` (`8564`) / `GWELL_CONTROL_PORT` (`18564`) / `GWELL_LOG_LEVEL` — gwell-proxy sidecar knobs (only relevant for OG-family cameras)
+- `GWELL_ENABLED` — master switch for Gwell protocol proxy (default `false`)
+- `GWELL_BINARY` — optional path to a user-supplied compatible `gwell-proxy`; otherwise the bridge searches `PATH`
+- `GWELL_RTSP_PORT` (`8564`) / `GWELL_CONTROL_PORT` (`18564`) / `GWELL_LOG_LEVEL` — proxy knobs (only relevant for OG-family cameras)
 
 ## Dependencies
 

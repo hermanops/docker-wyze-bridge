@@ -361,11 +361,14 @@ alert on it.
 
 **How does this work?**
 For TUTK cameras, go2rtc speaks Wyze's P2P protocol directly (no SDK).
-For OG cameras, a small `gwell-proxy` sidecar handles the Gwell/IoTVideo
-handshake. For doorbell-lineage cameras (Doorbell Pro, Doorbell Duo),
-go2rtc's built-in Wyze WebRTC handler calls our internal shim for the
-KVS signaling URL and dials Wyze's server itself. The bridge
-orchestrates auth, discovery, MQTT, and the WebUI.
+For OG cameras, the bridge can launch a user-supplied `gwell-proxy`
+executable to handle the Gwell/IoTVideo handshake. It is not included
+in the standard Docker image; set `GWELL_ENABLED=true` and provide the
+binary with `GWELL_BINARY` or on `PATH`. For doorbell-lineage cameras
+(Doorbell Pro, Doorbell Duo), go2rtc's built-in Wyze WebRTC handler
+calls our internal shim for the KVS signaling URL and dials Wyze's
+server itself. The bridge orchestrates auth, discovery, MQTT, and the
+WebUI.
 
 **Does it use internet bandwidth when streaming?**
 For TUTK and Gwell cameras on the same LAN: effectively zero — media
@@ -402,11 +405,13 @@ Docker Container
 │   └── Recording Manager      — ffmpeg per camera, segment pruning
 ├── go2rtc (managed sidecar, ports 1984 / 8554 / 8888 / 8889 / 8189)
 │   ├── wyze://   source       — TUTK P2P (built in)
-│   ├── rtsp:     source       — receives publish from gwell-proxy
+│   ├── rtsp:     source       — receives optional Gwell proxy publishes
 │   └── webrtc:   source       — native Wyze KVS (via our shim)
-└── gwell-proxy (only spawned for OG cameras)
-    └── Gwell P2P → ffmpeg → RTSP PUBLISH to loopback go2rtc
 ```
+
+The standard image does not include `gwell-proxy`. When OG support is
+explicitly enabled, the bridge starts a compatible executable supplied
+by the user; it waits for OG cameras to appear in discovery.
 
 ## Development
 
