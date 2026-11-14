@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 
@@ -87,7 +88,7 @@ func runStep(script string, env ...string) error {
 	return nil
 }
 
-func writeOCIArchive(t *testing.T, path string, corrupt bool) string {
+func writeOCIArchive(t *testing.T, path, arch string, corrupt bool) string {
 	t.Helper()
 	manifest := []byte(`{"schemaVersion":2}`)
 	sum := sha256.Sum256(manifest)
@@ -97,7 +98,7 @@ func writeOCIArchive(t *testing.T, path string, corrupt bool) string {
 		"manifests": []any{map[string]any{
 			"digest": "sha256:" + digest,
 			"platform": map[string]string{
-				"os": "linux", "architecture": "amd64",
+				"os": "linux", "architecture": arch,
 			},
 		}},
 	})
@@ -132,6 +133,57 @@ func writeOCIArchive(t *testing.T, path string, corrupt bool) string {
 	return "sha256:" + digest
 }
 
+func writeTrivyStub(t *testing.T, dir string) {
+	t.Helper()
+	trivy := `#!/bin/sh
+set -eu
+args="$*"
+inputs=0
+output=
+while [ "$#" -gt 0 ]; do
+	case "$1" in
+		--input)
+			[ "$#" -ge 2 ] && [ "$2" = "oci" ] && [ -d "$2" ] && [ -f "$2/index.json" ] || exit 1
+			inputs=$((inputs + 1))
+			shift 2 ;;
+		--output)
+			[ "$#" -ge 2 ] || exit 1
+			output=$2
+			shift 2 ;;
+		*) shift ;;
+	esac
+done
+[ "$inputs" -eq 1 ] || exit 1
+printf '%s\n' "$args" >> "$TRIVY_CALLS"
+if [ -n "$output" ]; then
+	case "$TEST_SBOM" in
+		missing) ;;
+		empty) : > "$output" ;;
+		invalid) printf '%s\n' '{"bomFormat":"wrong"}' > "$output" ;;
+		malformed) printf '%s\n' '{' > "$output" ;;
+		invalid-schema) printf '%s\n' '{"bomFormat":"CycloneDX"}' > "$output" ;;
+		generation-error) exit 1 ;;
+		*) printf '{"bomFormat":"CycloneDX","specVersion":"1.6","version":1,"metadata":{"component":{"type":"container","name":"%s"}}}\n' "$ARCH" > "$output" ;;
+	esac
+elif [ "$TEST_SBOM" = changed-after-generation ]; then
+	printf '%s\n' '{"bomFormat":"CycloneDX","changed":true}' > "sbom-$ARCH.cdx.json"
+elif [ "$TEST_SBOM" = critical ]; then
+	exit 1
+fi
+`
+	if err := os.WriteFile(filepath.Join(dir, "trivy"), []byte(trivy), 0700); err != nil {
+		t.Fatal(err)
+	}
+	validator := `#!/bin/sh
+set -eu
+[ "$*" = "validate --input-file sbom-$ARCH.cdx.json --input-format json --input-version v1_6 --fail-on-errors" ]
+jq -e '.bomFormat == "CycloneDX" and .specVersion == "1.6" and .version == 1' "sbom-$ARCH.cdx.json" >/dev/null
+`
+	if err := os.WriteFile(filepath.Join(dir, "cyclonedx"), []byte(validator), 0700); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestScannedArtifactConsistency(t *testing.T) {
 	requireTools(t, "bash", "jq", "tar", "sha256sum")
 	scan := workflowStep(t, "../.github/workflows/build-candidate.yml", "build", "Generate SBOM and scan candidate")
@@ -140,32 +192,14 @@ func TestScannedArtifactConsistency(t *testing.T) {
 	for _, corrupt := range []bool{false, true} {
 		t.Run(fmt.Sprintf("corrupt-manifest-%t", corrupt), func(t *testing.T) {
 			dir := t.TempDir()
-			manifest := writeOCIArchive(t, filepath.Join(dir, "image.tar"), corrupt)
-			trivy := `#!/bin/sh
-set -eu
-args="$*"
-inputs=0
-while [ "$#" -gt 0 ]; do
-	if [ "$1" = "--input" ]; then
-		[ "$#" -ge 2 ] && [ "$2" = "oci" ] && [ -d "$2" ] && [ -f "$2/index.json" ] || exit 1
-		inputs=$((inputs + 1))
-		shift 2
-	else
-		shift
-	fi
-done
-[ "$inputs" -eq 1 ] || exit 1
-printf '%s\n' "$args" >> "$TRIVY_CALLS"
-`
-			if err := os.WriteFile(filepath.Join(dir, "trivy"), []byte(trivy), 0700); err != nil {
-				t.Fatal(err)
-			}
+			manifest := writeOCIArchive(t, filepath.Join(dir, "image.tar"), "amd64", corrupt)
+			writeTrivyStub(t, dir)
 			output := filepath.Join(dir, "output")
 			if err := os.WriteFile(output, nil, 0600); err != nil {
 				t.Fatal(err)
 			}
 			calls := filepath.Join(dir, "trivy-calls")
-			err := runStep(scan, "RUNNER_TEMP="+dir, "GITHUB_OUTPUT="+output, "ARCH=amd64", "TRIVY_CALLS="+calls)
+			err := runStep(scan, "RUNNER_TEMP="+dir, "GITHUB_OUTPUT="+output, "ARCH=amd64", "TRIVY_CALLS="+calls, "TEST_SBOM=valid")
 			if corrupt {
 				if err == nil {
 					t.Fatal("corrupt OCI manifest accepted")
@@ -181,7 +215,7 @@ printf '%s\n' "$args" >> "$TRIVY_CALLS"
 			}
 			if bytes.Count(invocations, []byte("\n")) != 2 ||
 				!bytes.Contains(invocations, []byte("--format cyclonedx")) ||
-				!bytes.Contains(invocations, []byte("--scanners vuln")) {
+				!bytes.Contains(invocations, []byte("--scanners vuln --severity CRITICAL --exit-code 1 --ignorefile /dev/null")) {
 				t.Fatalf("expected SBOM and vulnerability scans of the OCI layout, got: %s", invocations)
 			}
 			results, err := os.ReadFile(output)
@@ -200,6 +234,15 @@ printf '%s\n' "$args" >> "$TRIVY_CALLS"
 			if !bytes.Contains(results, []byte("archive_sha256="+hash+"\n")) {
 				t.Fatalf("missing archive digest: %s", results)
 			}
+			sbom, err := os.ReadFile(filepath.Join(dir, "sbom-amd64.cdx.json"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			sbomSum := sha256.Sum256(sbom)
+			sbomHash := hex.EncodeToString(sbomSum[:])
+			if !bytes.Contains(results, []byte("sbom_sha256="+sbomHash+"\n")) {
+				t.Fatalf("missing SBOM digest: %s", results)
+			}
 			for _, arch := range []string{"amd64", "arm64"} {
 				target := filepath.Join(dir, "candidates", "candidate-"+arch)
 				if err := os.MkdirAll(target, 0700); err != nil {
@@ -208,9 +251,17 @@ printf '%s\n' "$args" >> "$TRIVY_CALLS"
 				if err := os.WriteFile(filepath.Join(target, "image.tar"), archive, 0600); err != nil {
 					t.Fatal(err)
 				}
+				target = filepath.Join(dir, "sboms", arch)
+				if err := os.MkdirAll(target, 0700); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(filepath.Join(target, "sbom-"+arch+".cdx.json"), sbom, 0600); err != nil {
+					t.Fatal(err)
+				}
 			}
 
-			env := []string{"RUNNER_TEMP=" + dir, "AMD64_ARCHIVE=" + hash, "ARM64_ARCHIVE=" + hash}
+			env := []string{"RUNNER_TEMP=" + dir, "AMD64_ARCHIVE=" + hash, "ARM64_ARCHIVE=" + hash,
+				"AMD64_SBOM=" + sbomHash, "ARM64_SBOM=" + sbomHash}
 			if err := runStep(verify, env...); err != nil {
 				t.Fatalf("valid candidate rejected: %v", err)
 			}
@@ -221,6 +272,194 @@ printf '%s\n' "$args" >> "$TRIVY_CALLS"
 				t.Fatal("modified candidate accepted")
 			}
 		})
+	}
+}
+
+func TestSBOMGeneration(t *testing.T) {
+	requireTools(t, "bash", "jq", "tar", "sha256sum")
+	scan := workflowStep(t, "../.github/workflows/build-candidate.yml", "build", "Generate SBOM and scan candidate")
+	for _, arch := range []string{"amd64", "arm64"} {
+		for _, scenario := range []string{"valid", "missing", "empty", "invalid", "invalid-schema", "malformed", "generation-error", "changed-after-generation", "critical"} {
+			t.Run(arch+"/"+scenario, func(t *testing.T) {
+				dir := t.TempDir()
+				writeOCIArchive(t, filepath.Join(dir, "image.tar"), arch, false)
+				writeTrivyStub(t, dir)
+				output := filepath.Join(dir, "output")
+				err := runStep(scan, "RUNNER_TEMP="+dir, "GITHUB_OUTPUT="+output, "ARCH="+arch,
+					"TRIVY_CALLS="+filepath.Join(dir, "calls"), "TEST_SBOM="+scenario)
+				if (err == nil) != (scenario == "valid") {
+					t.Fatalf("scan success = %t for %s: %v", err == nil, scenario, err)
+				}
+				if err != nil {
+					if data, readErr := os.ReadFile(output); readErr == nil && bytes.Contains(data, []byte("sbom_sha256=")) {
+						t.Fatalf("failed scan produced an SBOM output: %s", data)
+					}
+				}
+			})
+		}
+	}
+}
+
+func TestSBOMPublicationVerification(t *testing.T) {
+	requireTools(t, "bash", "sha256sum")
+	verify := workflowStep(t, "../.github/workflows/publish.yml", "publish", "Verify scanned artifacts")
+	for _, scenario := range []string{"valid", "missing-amd64", "missing-arm64", "empty-amd64", "empty-arm64",
+		"tampered-amd64", "tampered-arm64", "swapped", "missing-digest-amd64", "missing-digest-arm64",
+		"wrong-digest-amd64", "wrong-digest-arm64"} {
+		t.Run(scenario, func(t *testing.T) {
+			dir := t.TempDir()
+			archive := []byte("scanned candidate")
+			archiveSum := sha256.Sum256(archive)
+			hash := hex.EncodeToString(archiveSum[:])
+			sboms := map[string][]byte{
+				"amd64": []byte(`{"bomFormat":"CycloneDX","arch":"amd64"}`),
+				"arm64": []byte(`{"bomFormat":"CycloneDX","arch":"arm64"}`),
+			}
+			sbomHashes := make(map[string]string)
+			for _, arch := range []string{"amd64", "arm64"} {
+				target := filepath.Join(dir, "candidates", "candidate-"+arch)
+				if err := os.MkdirAll(target, 0700); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(filepath.Join(target, "image.tar"), archive, 0600); err != nil {
+					t.Fatal(err)
+				}
+				target = filepath.Join(dir, "sboms", arch)
+				if err := os.MkdirAll(target, 0700); err != nil {
+					t.Fatal(err)
+				}
+				sum := sha256.Sum256(sboms[arch])
+				sbomHashes[arch] = hex.EncodeToString(sum[:])
+				data := sboms[arch]
+				switch scenario {
+				case "missing-" + arch:
+					continue
+				case "empty-" + arch:
+					data = nil
+				case "tampered-" + arch:
+					data = []byte("tampered")
+				case "swapped":
+					if arch == "amd64" {
+						data = sboms["arm64"]
+					} else {
+						data = sboms["amd64"]
+					}
+				}
+				if err := os.WriteFile(filepath.Join(target, "sbom-"+arch+".cdx.json"), data, 0600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			for _, arch := range []string{"amd64", "arm64"} {
+				switch scenario {
+				case "missing-digest-" + arch:
+					sbomHashes[arch] = ""
+				case "wrong-digest-" + arch:
+					sbomHashes[arch] = strings.Repeat("0", 64)
+				}
+			}
+			err := runStep(verify, "RUNNER_TEMP="+dir, "AMD64_ARCHIVE="+hash, "ARM64_ARCHIVE="+hash,
+				"AMD64_SBOM="+sbomHashes["amd64"], "ARM64_SBOM="+sbomHashes["arm64"])
+			if (err == nil) != (scenario == "valid") {
+				t.Fatalf("verification success = %t for %s: %v", err == nil, scenario, err)
+			}
+		})
+	}
+}
+
+func TestSBOMArtifactWiring(t *testing.T) {
+	type step struct {
+		Name            string            `yaml:"name"`
+		Uses            string            `yaml:"uses"`
+		If              string            `yaml:"if"`
+		ContinueOnError bool              `yaml:"continue-on-error"`
+		With            map[string]string `yaml:"with"`
+		Env             map[string]string `yaml:"env"`
+	}
+	type job struct {
+		Steps   []step            `yaml:"steps"`
+		Outputs map[string]string `yaml:"outputs"`
+		With    map[string]string `yaml:"with"`
+		Uses    string            `yaml:"uses"`
+		Needs   yaml.Node         `yaml:"needs"`
+	}
+	type workflow struct {
+		On struct {
+			WorkflowCall struct {
+				Outputs map[string]struct {
+					Value string `yaml:"value"`
+				} `yaml:"outputs"`
+			} `yaml:"workflow_call"`
+		} `yaml:"on"`
+		Jobs map[string]job `yaml:"jobs"`
+	}
+	read := func(path string) workflow {
+		t.Helper()
+		var parsed workflow
+		data, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := yaml.Unmarshal(data, &parsed); err != nil {
+			t.Fatal(err)
+		}
+		return parsed
+	}
+	candidate := read("../.github/workflows/build-candidate.yml")
+	if candidate.On.WorkflowCall.Outputs["sbom_sha256"].Value != "${{ jobs.build.outputs.sbom_sha256 }}" ||
+		candidate.Jobs["build"].Outputs["sbom_sha256"] != "${{ steps.scan.outputs.sbom_sha256 }}" {
+		t.Fatal("candidate SBOM digest is not exposed as a workflow output")
+	}
+	var upload step
+	for _, s := range candidate.Jobs["build"].Steps {
+		if s.Name == "Upload SBOM" {
+			upload = s
+		}
+	}
+	if !strings.HasPrefix(upload.Uses, "actions/upload-artifact@") || upload.If != "" || upload.ContinueOnError ||
+		upload.With["if-no-files-found"] != "error" ||
+		upload.With["name"] != "sbom-${{ inputs.arch }}" ||
+		upload.With["path"] != "${{ runner.temp }}/sbom-${{ inputs.arch }}.cdx.json" {
+		t.Fatalf("SBOM upload is not mandatory and architecture-specific: %+v", upload)
+	}
+	publish := read("../.github/workflows/publish.yml")
+	var publishNeeds []string
+	publishJob := publish.Jobs["publish"]
+	if err := publishJob.Needs.Decode(&publishNeeds); err != nil {
+		t.Fatal(err)
+	}
+	verificationIndex, publicationIndex := -1, -1
+	for i, s := range publish.Jobs["publish"].Steps {
+		if s.Name == "Verify scanned artifacts" {
+			verificationIndex = i
+		}
+		if s.Name == "Login to GHCR" {
+			publicationIndex = i
+		}
+	}
+	if verificationIndex < 0 || publicationIndex <= verificationIndex {
+		t.Fatal("artifact verification must precede GHCR access")
+	}
+	for _, arch := range []string{"amd64", "arm64"} {
+		build := publish.Jobs["build-"+arch]
+		if build.With["arch"] != arch || build.Uses != "./.github/workflows/build-candidate.yml" ||
+			!slices.Contains(publishNeeds, "build-"+arch) {
+			t.Fatalf("candidate job is not bound to %s", arch)
+		}
+		downloadFound, digestFound := false, false
+		for i, s := range publish.Jobs["publish"].Steps {
+			if strings.HasPrefix(s.Uses, "actions/download-artifact@") && s.If == "" && !s.ContinueOnError &&
+				s.With["name"] == "sbom-"+arch && s.With["path"] == "${{ runner.temp }}/sboms/"+arch &&
+				i < verificationIndex {
+				downloadFound = true
+			}
+			if s.Name == "Verify scanned artifacts" && s.If == "" && !s.ContinueOnError &&
+				s.Env[strings.ToUpper(arch)+"_SBOM"] == "${{ needs.build-"+arch+".outputs.sbom_sha256 }}" {
+				digestFound = true
+			}
+		}
+		if !downloadFound || !digestFound {
+			t.Fatalf("SBOM download or digest is not bound to the %s candidate", arch)
+		}
 	}
 }
 
