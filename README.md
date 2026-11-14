@@ -1,8 +1,8 @@
 # Docker Wyze Bridge
 
-[![GitHub release (latest by date)](https://img.shields.io/github/v/release/idisposable/docker-wyze-bridge?logo=github)](https://github.com/idisposable/docker-wyze-bridge/releases/latest)
+[![GitHub release (latest by date)](https://img.shields.io/github/v/release/hermanops/docker-wyze-bridge?logo=github)](https://github.com/hermanops/docker-wyze-bridge/releases/latest)
 [![GHCR Package](https://img.shields.io/badge/ghcr-package-blue?logo=github)](https://ghcr.io/hermanops/docker-wyze-bridge)
-[![Docker](https://github.com/IDisposable/docker-wyze-bridge/actions/workflows/docker-image.yml/badge.svg)](https://github.com/IDisposable/docker-wyze-bridge/actions/workflows/docker-image.yml)
+[![Docker](https://github.com/hermanops/docker-wyze-bridge/actions/workflows/docker-image.yml/badge.svg)](https://github.com/hermanops/docker-wyze-bridge/actions/workflows/docker-image.yml)
 [![Home Assistant Add-on](https://img.shields.io/badge/home_assistant-add--on-blue.svg?logo=homeassistant&logoColor=white)](./docs/user_guide/install_ha.md)
 
 Local WebRTC / RTSP / HLS bridge for Wyze cameras. No modifications, no
