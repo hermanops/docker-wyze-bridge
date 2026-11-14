@@ -170,6 +170,61 @@ without registry credentials or image publication. External-fork PRs use the
 `pull_request` event, not `pull_request_target`; GitHub's fork approval and
 token restrictions still apply.
 
+### Test candidates
+
+The manual **Publish test candidate** workflow must first exist on `main`.
+Dispatch it from `main` with a branch name or commit as `source_ref`; it
+resolves that ref once and builds the resulting commit for both amd64 and
+arm64. The build jobs have read-only permissions and use the same SBOM,
+checksum, and CRITICAL scan gates as production. Candidate builds embed
+`0.0.0` as their application version; they do not create a version tag.
+
+After both builds pass, the publish job verifies their archives and SBOMs and
+promotes the scanned manifests without rebuilding. Its run summary gives the
+exact `ghcr.io/hermanops/docker-wyze-bridge:candidate-<sha>-<run>-<attempt>-<nonce>`
+reference and pull command after the multi-architecture index is verified.
+The job's `GITHUB_TOKEN` needs package write permission. A first candidate
+push can create the package: an authenticated `NAME_UNKNOWN` response does not
+prove that it is absent or inaccessible, so the workflow uses a random tag
+suffix and requires package access after the first write. A successful listing
+does not prove write access. Private packages require GHCR authentication on
+the homelab.
+
+Automatic cleanup is not implemented. Candidate and per-architecture tags may
+remain after a failed run. GHCR package-version deletion can remove other tags
+sharing the same manifest, so do not delete a version solely because it has a
+candidate tag. The workflow rejects existing candidate tags and serializes its
+own publish jobs; a newer pending job may replace an older pending job. GHCR's
+check and write are not atomic against other registry writers. Restrict package
+write access. The workflow never intentionally writes production or `latest`
+tags.
+
+For an isolated test, use a separate Compose project and separate configuration
+and media directories, substituting the verified image from the run summary:
+
+```yaml
+services:
+  candidate:
+    image: ghcr.io/hermanops/docker-wyze-bridge:candidate-<sha>-<run>-<attempt>-<nonce>
+    env_file: ./candidate.env
+    ports:
+      - "15080:5080"
+      - "11984:1984"
+      - "18554:8554"
+      - "18888:8888"
+      - "18889:8889"
+      - "18189:8189/udp"
+    volumes:
+      - ./candidate-config:/config
+      - ./candidate-media:/media
+```
+
+Keep the candidate's MQTT topics, recording settings, and camera access
+separate from production. WebRTC ICE may require additional network
+configuration for the remapped UDP port; validate it in the target homelab.
+
+### Production releases
+
 Publishing is a separate, manual workflow. **Before enabling Actions or
 dispatching it**, configure these repository settings:
 

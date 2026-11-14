@@ -302,65 +302,382 @@ func TestSBOMGeneration(t *testing.T) {
 
 func TestSBOMPublicationVerification(t *testing.T) {
 	requireTools(t, "bash", "sha256sum")
-	verify := workflowStep(t, "../.github/workflows/publish.yml", "publish", "Verify scanned artifacts")
-	for _, scenario := range []string{"valid", "missing-amd64", "missing-arm64", "empty-amd64", "empty-arm64",
-		"tampered-amd64", "tampered-arm64", "swapped", "missing-digest-amd64", "missing-digest-arm64",
-		"wrong-digest-amd64", "wrong-digest-arm64"} {
+	for _, workflow := range []string{"publish.yml", "publish-candidate.yml"} {
+		t.Run(workflow, func(t *testing.T) {
+			verify := workflowStep(t, "../.github/workflows/"+workflow, "publish", "Verify scanned artifacts")
+			for _, scenario := range []string{"valid", "missing-amd64", "missing-arm64", "empty-amd64", "empty-arm64",
+				"tampered-amd64", "tampered-arm64", "swapped", "missing-digest-amd64", "missing-digest-arm64",
+				"wrong-digest-amd64", "wrong-digest-arm64"} {
+				t.Run(scenario, func(t *testing.T) {
+					dir := t.TempDir()
+					archive := []byte("scanned candidate")
+					archiveSum := sha256.Sum256(archive)
+					hash := hex.EncodeToString(archiveSum[:])
+					sboms := map[string][]byte{
+						"amd64": []byte(`{"bomFormat":"CycloneDX","arch":"amd64"}`),
+						"arm64": []byte(`{"bomFormat":"CycloneDX","arch":"arm64"}`),
+					}
+					sbomHashes := make(map[string]string)
+					for _, arch := range []string{"amd64", "arm64"} {
+						target := filepath.Join(dir, "candidates", "candidate-"+arch)
+						if err := os.MkdirAll(target, 0700); err != nil {
+							t.Fatal(err)
+						}
+						if err := os.WriteFile(filepath.Join(target, "image.tar"), archive, 0600); err != nil {
+							t.Fatal(err)
+						}
+						target = filepath.Join(dir, "sboms", arch)
+						if err := os.MkdirAll(target, 0700); err != nil {
+							t.Fatal(err)
+						}
+						sum := sha256.Sum256(sboms[arch])
+						sbomHashes[arch] = hex.EncodeToString(sum[:])
+						data := sboms[arch]
+						switch scenario {
+						case "missing-" + arch:
+							continue
+						case "empty-" + arch:
+							data = nil
+						case "tampered-" + arch:
+							data = []byte("tampered")
+						case "swapped":
+							if arch == "amd64" {
+								data = sboms["arm64"]
+							} else {
+								data = sboms["amd64"]
+							}
+						}
+						if err := os.WriteFile(filepath.Join(target, "sbom-"+arch+".cdx.json"), data, 0600); err != nil {
+							t.Fatal(err)
+						}
+					}
+					for _, arch := range []string{"amd64", "arm64"} {
+						switch scenario {
+						case "missing-digest-" + arch:
+							sbomHashes[arch] = ""
+						case "wrong-digest-" + arch:
+							sbomHashes[arch] = strings.Repeat("0", 64)
+						}
+					}
+					err := runStep(verify, "RUNNER_TEMP="+dir, "AMD64_ARCHIVE="+hash, "ARM64_ARCHIVE="+hash,
+						"AMD64_SBOM="+sbomHashes["amd64"], "ARM64_SBOM="+sbomHashes["arm64"])
+					if (err == nil) != (scenario == "valid") {
+						t.Fatalf("verification success = %t for %s: %v", err == nil, scenario, err)
+					}
+				})
+			}
+		})
+	}
+}
+
+func TestCandidateSourceSHA(t *testing.T) {
+	requireTools(t, "bash")
+	validate := workflowStep(t, "../.github/workflows/build-candidate.yml", "build", "Validate inputs")
+	for _, tt := range []struct {
+		name, sha string
+		ok        bool
+	}{
+		{"default", "", true},
+		{"valid", strings.Repeat("a", 40), true},
+		{"short", strings.Repeat("a", 12), false},
+		{"invalid", strings.Repeat("g", 40), false},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			err := runStep(validate, "ARCH=amd64", "VERSION=0.0.0", "SOURCE_SHA="+tt.sha)
+			if (err == nil) != tt.ok {
+				t.Fatalf("validation success = %t, want %t: %v", err == nil, tt.ok, err)
+			}
+		})
+	}
+}
+
+func TestCandidateWorkflowWiring(t *testing.T) {
+	type step struct {
+		Name string            `yaml:"name"`
+		Uses string            `yaml:"uses"`
+		If   string            `yaml:"if"`
+		With map[string]string `yaml:"with"`
+		Env  map[string]string `yaml:"env"`
+	}
+	type job struct {
+		Uses        string            `yaml:"uses"`
+		Needs       yaml.Node         `yaml:"needs"`
+		With        map[string]string `yaml:"with"`
+		Permissions map[string]string `yaml:"permissions"`
+		Steps       []step            `yaml:"steps"`
+	}
+	readJobs := func(path string) map[string]job {
+		t.Helper()
+		data, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var workflow struct {
+			Jobs map[string]job `yaml:"jobs"`
+		}
+		if err := yaml.Unmarshal(data, &workflow); err != nil {
+			t.Fatal(err)
+		}
+		return workflow.Jobs
+	}
+	build := readJobs("../.github/workflows/build-candidate.yml")["build"]
+	trustedSetup, sourceCheckout, sourceBuild := -1, -1, -1
+	for i, s := range build.Steps {
+		switch {
+		case s.Uses == "./.github/actions/setup-buildx":
+			trustedSetup = i
+		case strings.HasPrefix(s.Uses, "actions/checkout@") && s.With["path"] == "candidate-source" &&
+			s.With["ref"] == "${{ inputs.source_sha }}" && s.With["persist-credentials"] == "false" &&
+			s.If == "inputs.source_sha != ''":
+			sourceCheckout = i
+		case s.Name == "Build candidate OCI archive" &&
+			s.With["context"] == "${{ inputs.source_sha != '' && './candidate-source' || '.' }}" &&
+			s.With["file"] == "${{ inputs.source_sha != '' && './candidate-source/docker/Dockerfile' || 'docker/Dockerfile' }}":
+			sourceBuild = i
+		}
+	}
+	if trustedSetup < 0 || sourceCheckout <= trustedSetup || sourceBuild <= sourceCheckout {
+		t.Fatal("selected source must be isolated from the trusted setup action")
+	}
+	jobs := readJobs("../.github/workflows/publish-candidate.yml")
+	for _, arch := range []string{"amd64", "arm64"} {
+		build := jobs["build-"+arch]
+		if build.Uses != "./.github/workflows/build-candidate.yml" ||
+			build.With["arch"] != arch ||
+			build.With["source_sha"] != "${{ needs.validate.outputs.source_sha }}" ||
+			build.Permissions["contents"] != "read" || len(build.Permissions) != 1 {
+			t.Fatalf("invalid %s build configuration: %+v", arch, build)
+		}
+	}
+	publish := jobs["publish"]
+	var needs []string
+	if err := publish.Needs.Decode(&needs); err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Contains(needs, "build-amd64") || !slices.Contains(needs, "build-arm64") ||
+		publish.Permissions["packages"] != "write" || publish.Permissions["actions"] != "read" ||
+		publish.Permissions["contents"] != "read" || len(publish.Permissions) != 3 {
+		t.Fatal("candidate publish dependencies or permissions are incorrect")
+	}
+	verification, login := -1, -1
+	for i, s := range publish.Steps {
+		if s.Name == "Verify scanned artifacts" {
+			verification = i
+		}
+		if s.Name == "Login to GHCR" {
+			login = i
+		}
+	}
+	if verification < 0 || login <= verification {
+		t.Fatal("candidate artifact verification must precede registry login")
+	}
+	for _, arch := range []string{"amd64", "arm64"} {
+		found := false
+		for i, s := range publish.Steps {
+			if i < verification && strings.HasPrefix(s.Uses, "actions/download-artifact@") &&
+				s.With["name"] == "sbom-"+arch && s.With["path"] == "${{ runner.temp }}/sboms/"+arch {
+				found = true
+			}
+		}
+		if !found || publish.Steps[verification].Env[strings.ToUpper(arch)+"_SBOM"] !=
+			"${{ needs.build-"+arch+".outputs.sbom_sha256 }}" {
+			t.Fatalf("candidate %s SBOM download and digest are not bound to the build", arch)
+		}
+	}
+}
+
+func TestPublishCandidateManifests(t *testing.T) {
+	requireTools(t, "bash", "jq", "sha256sum", "cut")
+	publish := workflowStep(t, "../.github/workflows/publish-candidate.yml", "publish", "Publish scanned candidate manifests")
+	amd, arm := []byte("amd64 manifest"), []byte("arm64 manifest")
+	amdSum, armSum := sha256.Sum256(amd), sha256.Sum256(arm)
+	amdDigest, armDigest := "sha256:"+hex.EncodeToString(amdSum[:]), "sha256:"+hex.EncodeToString(armSum[:])
+	sha := strings.Repeat("a", 40)
+	tag := "candidate-aaaaaaaaaaaa-123-1-" + strings.Repeat("b", 32)
+	for _, scenario := range []string{"existing-package", "first-publication", "first-name-unknown", "first-collision", "first-write-denied",
+		"first-post-write-forbidden", "existing-index", "existing-amd64", "existing-arm64",
+		"ambiguous-package-404", "package-forbidden", "wrong-package", "package-network-error",
+		"unauthorized", "bad-response", "auth-failure", "tampered-manifest", "invalid-nonce"} {
 		t.Run(scenario, func(t *testing.T) {
 			dir := t.TempDir()
-			archive := []byte("scanned candidate")
-			archiveSum := sha256.Sum256(archive)
-			hash := hex.EncodeToString(archiveSum[:])
-			sboms := map[string][]byte{
-				"amd64": []byte(`{"bomFormat":"CycloneDX","arch":"amd64"}`),
-				"arm64": []byte(`{"bomFormat":"CycloneDX","arch":"arm64"}`),
+			dockerStub := `#!/bin/sh
+printf '%s\n' "$*" >> "$TEST_CALLS"
+case "$*" in
+  *" copy --preserve-digests "*)
+    [ "$TEST_CASE" != first-write-denied ] || exit 1
+    : > "$TEST_PACKAGE_CREATED"
+    exit 0 ;;
+  *" inspect --raw "*)
+    for last do :; done
+    case "$last" in
+      "docker://ghcr.io/hermanops/docker-wyze-bridge@$AMD64_MANIFEST") cat "$TEST_AMD64" ;;
+      "docker://ghcr.io/hermanops/docker-wyze-bridge@$ARM64_MANIFEST") cat "$TEST_ARM64" ;;
+      *) exit 1 ;;
+    esac ;;
+  "buildx imagetools create "*) exit 0 ;;
+  *) exit 1 ;;
+esac
+`
+			curlStub := `#!/bin/sh
+output=
+next_output=
+for arg do
+  if [ "$next_output" = yes ]; then output="$arg"; next_output=; continue; fi
+  case "$arg" in
+    --output) next_output=yes ;;
+    https://*) url="$arg" ;;
+  esac
+done
+config=$(cat)
+expected='header = "Authorization: Bearer mock-registry-token"'
+if [ "$TEST_CASE" = first-publication ] && [ -f "$TEST_PACKAGE_CREATED" ]; then
+  expected='header = "Authorization: Bearer refreshed-registry-token"'
+fi
+case "$url" in
+  https://ghcr.io/token)
+    [ "$config" = 'user = "hermanops:mock-token"' ] || exit 1
+    [ "$TEST_CASE" != auth-failure ] || exit 7
+    if [ "$TEST_CASE" = first-publication ] && [ -f "$TEST_PACKAGE_CREATED" ]; then
+      printf '%s' '{"token":"refreshed-registry-token"}'
+    else
+      printf '%s' '{"token":"mock-registry-token"}'
+    fi ;;
+  "https://ghcr.io/v2/hermanops/docker-wyze-bridge/tags/list?n=1")
+    [ "$config" = "$expected" ] || exit 1
+    case "$TEST_CASE" in
+      first-publication|first-name-unknown|first-collision|first-write-denied|first-post-write-forbidden)
+        if [ ! -f "$TEST_PACKAGE_CREATED" ]; then
+          printf '%s' '{"errors":[{"code":"NAME_UNKNOWN"}]}' > "$output"; printf 404
+        elif [ "$TEST_CASE" = first-post-write-forbidden ]; then
+          printf '%s' '{}' > "$output"; printf 403
+        else
+          printf '%s' '{"name":"hermanops/docker-wyze-bridge","tags":[]}' > "$output"; printf 200
+        fi ;;
+      ambiguous-package-404) printf '%s' '{}' > "$output"; printf 404 ;;
+      package-forbidden) printf '%s' '{}' > "$output"; printf 403 ;;
+      wrong-package) printf '%s' '{"name":"other/package","tags":[]}' > "$output"; printf 200 ;;
+      package-network-error) exit 7 ;;
+      *) printf '%s' '{"name":"hermanops/docker-wyze-bridge","tags":[]}' > "$output"; printf 200 ;;
+    esac ;;
+  https://ghcr.io/v2/hermanops/docker-wyze-bridge/manifests/*)
+    [ "$config" = "$expected" ] || exit 1
+    tag=${url##*/}
+    case "$TEST_CASE:$tag" in
+      existing-index:"$TEST_TAG"|existing-amd64:"$TEST_TAG-amd64"|existing-arm64:"$TEST_TAG-arm64")
+        printf '%s' '{}' > "$output"; printf 200 ;;
+      first-collision:"$TEST_TAG-amd64") printf '%s' '{}' > "$output"; printf 200 ;;
+      unauthorized:*) printf '%s' '{}' > "$output"; printf 401 ;;
+      bad-response:*) printf '%s' '{"errors":[{"code":"NAME_UNKNOWN"}]}' > "$output"; printf 404 ;;
+      first-name-unknown:*)
+        if [ ! -f "$TEST_PACKAGE_CREATED" ]; then
+          printf '%s' '{"errors":[{"code":"NAME_UNKNOWN"}]}' > "$output"; printf 404
+        else
+          printf '%s' '{"errors":[{"code":"MANIFEST_UNKNOWN"}]}' > "$output"; printf 404
+        fi ;;
+      *) printf '%s' '{"errors":[{"code":"MANIFEST_UNKNOWN"}]}' > "$output"; printf 404 ;;
+    esac ;;
+  *) exit 1 ;;
+esac
+`
+			opensslStub := `#!/bin/sh
+[ "$*" = "rand -hex 16" ] || exit 1
+if [ "$TEST_CASE" = invalid-nonce ]; then printf '%s\n' invalid; else printf '%s\n' bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb; fi
+`
+			armContent := arm
+			if scenario == "tampered-manifest" {
+				armContent = []byte("tampered")
 			}
-			sbomHashes := make(map[string]string)
-			for _, arch := range []string{"amd64", "arm64"} {
-				target := filepath.Join(dir, "candidates", "candidate-"+arch)
-				if err := os.MkdirAll(target, 0700); err != nil {
-					t.Fatal(err)
-				}
-				if err := os.WriteFile(filepath.Join(target, "image.tar"), archive, 0600); err != nil {
-					t.Fatal(err)
-				}
-				target = filepath.Join(dir, "sboms", arch)
-				if err := os.MkdirAll(target, 0700); err != nil {
-					t.Fatal(err)
-				}
-				sum := sha256.Sum256(sboms[arch])
-				sbomHashes[arch] = hex.EncodeToString(sum[:])
-				data := sboms[arch]
-				switch scenario {
-				case "missing-" + arch:
-					continue
-				case "empty-" + arch:
-					data = nil
-				case "tampered-" + arch:
-					data = []byte("tampered")
-				case "swapped":
-					if arch == "amd64" {
-						data = sboms["arm64"]
-					} else {
-						data = sboms["amd64"]
-					}
-				}
-				if err := os.WriteFile(filepath.Join(target, "sbom-"+arch+".cdx.json"), data, 0600); err != nil {
+			for name, content := range map[string][]byte{
+				"docker": []byte(dockerStub), "curl": []byte(curlStub), "openssl": []byte(opensslStub),
+				"amd64": amd, "arm64": armContent,
+			} {
+				if err := os.WriteFile(filepath.Join(dir, name), content, 0700); err != nil {
 					t.Fatal(err)
 				}
 			}
-			for _, arch := range []string{"amd64", "arm64"} {
-				switch scenario {
-				case "missing-digest-" + arch:
-					sbomHashes[arch] = ""
-				case "wrong-digest-" + arch:
-					sbomHashes[arch] = strings.Repeat("0", 64)
+			calls, output := filepath.Join(dir, "calls"), filepath.Join(dir, "output")
+			err := runStep(publish, "PATH="+dir+string(os.PathListSeparator)+os.Getenv("PATH"),
+				"RUNNER_TEMP="+dir, "GITHUB_OUTPUT="+output, "TEST_CALLS="+calls,
+				"TEST_AMD64="+filepath.Join(dir, "amd64"), "TEST_ARM64="+filepath.Join(dir, "arm64"),
+				"TEST_PACKAGE_CREATED="+filepath.Join(dir, "package-created"),
+				"TEST_CASE="+scenario, "TEST_TAG="+tag, "SOURCE_SHA="+sha,
+				"GITHUB_REPOSITORY=hermanops/docker-wyze-bridge", "GITHUB_REPOSITORY_OWNER=hermanops",
+				"GITHUB_RUN_ID=123", "GITHUB_RUN_ATTEMPT=1", "GHCR_TOKEN=mock-token", "SKOPEO_IMAGE=skopeo",
+				"AMD64_MANIFEST="+amdDigest, "ARM64_MANIFEST="+armDigest)
+			success := scenario == "existing-package" || scenario == "first-publication" || scenario == "first-name-unknown"
+			if (err == nil) != success {
+				t.Fatalf("publication success = %t for %s: %v", err == nil, scenario, err)
+			}
+			log, readErr := os.ReadFile(calls)
+			if readErr != nil && !os.IsNotExist(readErr) {
+				t.Fatal(readErr)
+			}
+			if !success && scenario != "tampered-manifest" && scenario != "first-write-denied" &&
+				scenario != "first-post-write-forbidden" && len(log) != 0 {
+				t.Fatalf("registry writes before preflight success: %s", log)
+			}
+			indexCommand := "buildx imagetools create --tag ghcr.io/hermanops/docker-wyze-bridge:" + tag
+			if strings.Contains(string(log), indexCommand) != success {
+				t.Fatalf("unexpected index publication: %s", log)
+			}
+			if scenario == "first-write-denied" || scenario == "first-post-write-forbidden" {
+				if strings.Count(string(log), " copy --preserve-digests ") != 1 {
+					t.Fatalf("unexpected writes after first push: %s", log)
 				}
 			}
-			err := runStep(verify, "RUNNER_TEMP="+dir, "AMD64_ARCHIVE="+hash, "ARM64_ARCHIVE="+hash,
-				"AMD64_SBOM="+sbomHashes["amd64"], "ARM64_SBOM="+sbomHashes["arm64"])
-			if (err == nil) != (scenario == "valid") {
-				t.Fatalf("verification success = %t for %s: %v", err == nil, scenario, err)
+			if success {
+				data, err := os.ReadFile(output)
+				if err != nil || string(data) != "image=ghcr.io/hermanops/docker-wyze-bridge:"+tag+"\n" {
+					t.Fatalf("unexpected output %q: %v", data, err)
+				}
+			}
+		})
+	}
+}
+
+func TestVerifyCandidateIndex(t *testing.T) {
+	requireTools(t, "bash", "jq")
+	verify := workflowStep(t, "../.github/workflows/publish-candidate.yml", "publish", "Verify candidate index")
+	amd := "sha256:" + strings.Repeat("a", 64)
+	arm := "sha256:" + strings.Repeat("b", 64)
+	for _, tt := range []struct {
+		name, armDigest string
+		ok              bool
+	}{
+		{"valid", arm, true},
+		{"wrong-arm", amd, false},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			dir := t.TempDir()
+			index, err := json.Marshal(map[string]any{
+				"schemaVersion": 2, "mediaType": "application/vnd.oci.image.index.v1+json",
+				"manifests": []any{
+					map[string]any{"platform": map[string]string{"os": "linux", "architecture": "amd64"}, "digest": amd},
+					map[string]any{"platform": map[string]string{"os": "linux", "architecture": "arm64"}, "digest": tt.armDigest},
+				},
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(dir, "index"), index, 0600); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(dir, "docker"), []byte("#!/bin/sh\ncat \"$TEST_INDEX\"\n"), 0700); err != nil {
+				t.Fatal(err)
+			}
+			image := "ghcr.io/hermanops/docker-wyze-bridge:candidate-test"
+			summary := filepath.Join(dir, "summary")
+			err = runStep(verify, "PATH="+dir+string(os.PathListSeparator)+os.Getenv("PATH"),
+				"TEST_INDEX="+filepath.Join(dir, "index"), "GITHUB_STEP_SUMMARY="+summary,
+				"SKOPEO_IMAGE=skopeo", "IMAGE="+image, "AMD64_MANIFEST="+amd, "ARM64_MANIFEST="+arm)
+			if (err == nil) != tt.ok {
+				t.Fatalf("index verification success = %t, want %t: %v", err == nil, tt.ok, err)
+			}
+			if tt.ok {
+				data, err := os.ReadFile(summary)
+				if err != nil || !bytes.Contains(data, []byte("docker pull "+image)) {
+					t.Fatalf("missing candidate pull command in summary: %s (%v)", data, err)
+				}
 			}
 		})
 	}
