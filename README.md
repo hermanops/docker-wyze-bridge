@@ -6,7 +6,7 @@
 [![Home Assistant Add-on](https://img.shields.io/badge/home_assistant-add--on-blue.svg?logo=homeassistant&logoColor=white)](./docs/user_guide/install_ha.md)
 
 Local WebRTC / RTSP / HLS bridge for Wyze cameras. No modifications, no
-special firmware, no cloud dependency for streaming (TUTK + OG cameras
+special firmware, no cloud dependency for streaming (TUTK cameras
 stay entirely on-LAN; doorbell-lineage cameras use Wyze's own WebRTC
 signaling but the media still flows directly to you).
 
