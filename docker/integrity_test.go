@@ -141,14 +141,31 @@ func TestScannedArtifactConsistency(t *testing.T) {
 		t.Run(fmt.Sprintf("corrupt-manifest-%t", corrupt), func(t *testing.T) {
 			dir := t.TempDir()
 			manifest := writeOCIArchive(t, filepath.Join(dir, "image.tar"), corrupt)
-			if err := os.WriteFile(filepath.Join(dir, "trivy"), []byte("#!/bin/sh\nexit 0\n"), 0700); err != nil {
+			trivy := `#!/bin/sh
+set -eu
+args="$*"
+inputs=0
+while [ "$#" -gt 0 ]; do
+	if [ "$1" = "--input" ]; then
+		[ "$#" -ge 2 ] && [ "$2" = "oci" ] && [ -d "$2" ] && [ -f "$2/index.json" ] || exit 1
+		inputs=$((inputs + 1))
+		shift 2
+	else
+		shift
+	fi
+done
+[ "$inputs" -eq 1 ] || exit 1
+printf '%s\n' "$args" >> "$TRIVY_CALLS"
+`
+			if err := os.WriteFile(filepath.Join(dir, "trivy"), []byte(trivy), 0700); err != nil {
 				t.Fatal(err)
 			}
 			output := filepath.Join(dir, "output")
 			if err := os.WriteFile(output, nil, 0600); err != nil {
 				t.Fatal(err)
 			}
-			err := runStep(scan, "RUNNER_TEMP="+dir, "GITHUB_OUTPUT="+output, "ARCH=amd64")
+			calls := filepath.Join(dir, "trivy-calls")
+			err := runStep(scan, "RUNNER_TEMP="+dir, "GITHUB_OUTPUT="+output, "ARCH=amd64", "TRIVY_CALLS="+calls)
 			if corrupt {
 				if err == nil {
 					t.Fatal("corrupt OCI manifest accepted")
@@ -157,6 +174,15 @@ func TestScannedArtifactConsistency(t *testing.T) {
 			}
 			if err != nil {
 				t.Fatal(err)
+			}
+			invocations, err := os.ReadFile(calls)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if bytes.Count(invocations, []byte("\n")) != 2 ||
+				!bytes.Contains(invocations, []byte("--format cyclonedx")) ||
+				!bytes.Contains(invocations, []byte("--scanners vuln")) {
+				t.Fatalf("expected SBOM and vulnerability scans of the OCI layout, got: %s", invocations)
 			}
 			results, err := os.ReadFile(output)
 			if err != nil {
