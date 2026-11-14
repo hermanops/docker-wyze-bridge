@@ -18,6 +18,7 @@ func TestLoadDefaults(t *testing.T) {
 	t.Setenv("AUDIO", "")
 	t.Setenv("MQTT_TOPIC", "")
 	t.Setenv("MQTT_DISCOVERY_TOPIC", "")
+	t.Setenv("GWELL_ENABLED", "")
 
 	cfg, err := Load()
 	if err != nil {
@@ -41,6 +42,21 @@ func TestLoadDefaults(t *testing.T) {
 	}
 	if cfg.StateDir != "/config" {
 		t.Errorf("StateDir = %q, want /config", cfg.StateDir)
+	}
+	if cfg.GwellEnabled {
+		t.Error("GwellEnabled should default to false")
+	}
+}
+
+func TestLoadGwellEnabledOverride(t *testing.T) {
+	t.Setenv("GWELL_ENABLED", "true")
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load() error: %v", err)
+	}
+	if !cfg.GwellEnabled {
+		t.Error("GWELL_ENABLED=true should enable Gwell")
 	}
 }
 

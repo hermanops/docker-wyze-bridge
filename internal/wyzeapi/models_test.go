@@ -92,6 +92,25 @@ func TestCameraInfo_IsGwell(t *testing.T) {
 	}
 }
 
+func TestCameraInfo_IsWebRTCStreamer(t *testing.T) {
+	tests := []struct {
+		model string
+		want  bool
+	}{
+		{model: "GW_BE1", want: true},
+		{model: "GW_DBD", want: true},
+		{model: "GW_GC1", want: false},
+		{model: "GW_GC2", want: false},
+	}
+
+	for _, tt := range tests {
+		cam := CameraInfo{Model: tt.model}
+		if got := cam.IsWebRTCStreamer(); got != tt.want {
+			t.Errorf("IsWebRTCStreamer(%q) = %t, want %t", tt.model, got, tt.want)
+		}
+	}
+}
+
 func TestCameraInfo_IsPanCam(t *testing.T) {
 	pan := CameraInfo{Model: "HL_PAN3"}
 	if !pan.IsPanCam() {
