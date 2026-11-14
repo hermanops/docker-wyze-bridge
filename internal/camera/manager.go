@@ -120,23 +120,9 @@ func (m *Manager) Discover(ctx context.Context) error {
 		return err
 	}
 
-	// Filter out unsupported and user-filtered cameras.
-	// Gwell-protocol cameras only get into the registry when
-	// GWELL_ENABLED=true; gwell-proxy (spawned from cmd/wyze-bridge)
-	// owns their actual streaming via the /internal/wyze/* shim.
-	// When the flag is off, we preserve the pre-4.0 "skip" behavior
-	// so folks without GW_ cameras don't pay the subprocess cost.
-	var supported []wyzeapi.CameraInfo
-	for _, cam := range cameras {
-		if cam.IsGwell() && !m.cfg.GwellEnabled {
-			m.log.Debug().
-				Str("cam", cam.Nickname).
-				Str("model", cam.Model).
-				Msg("skipping Gwell camera (GWELL_ENABLED=false)")
-			continue
-		}
-		supported = append(supported, cam)
-	}
+	// OG Gwell cameras require the optional proxy; WebRTC-streaming
+	// doorbells do not and remain discoverable even when it is disabled.
+	supported := filterGwellCameras(cameras, m.cfg.GwellEnabled, m.log)
 
 	filtered := m.filter.Apply(supported)
 
@@ -186,6 +172,21 @@ func (m *Manager) Discover(ctx context.Context) error {
 	}
 
 	return nil
+}
+
+func filterGwellCameras(cameras []wyzeapi.CameraInfo, enabled bool, log zerolog.Logger) []wyzeapi.CameraInfo {
+	supported := make([]wyzeapi.CameraInfo, 0, len(cameras))
+	for _, cam := range cameras {
+		if cam.IsGwell() && !cam.IsWebRTCStreamer() && !enabled {
+			log.Debug().
+				Str("cam", cam.Nickname).
+				Str("model", cam.Model).
+				Msg("skipping OG Gwell camera (Gwell streaming disabled)")
+			continue
+		}
+		supported = append(supported, cam)
+	}
+	return supported
 }
 
 // ConnectAll attempts to connect all offline/errored cameras to go2rtc in parallel.

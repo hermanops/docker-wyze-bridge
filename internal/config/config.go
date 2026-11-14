@@ -208,12 +208,11 @@ func Load() (*Config, error) {
 		// (GW_GC1 / GW_GC2). Doorbell-lineage Gwell models
 		// (GW_BE1 / GW_DBD) stream via go2rtc's native Wyze WebRTC
 		// handler instead and don't need gwell-proxy at all; see
-		// internal/wyzeapi/models.go IsWebRTCStreamer. Default ON —
-		// the sidecar only spawns when an OG camera is actually
-		// discovered, so users without OG cameras pay zero cost and
-		// see no log spam. Set GWELL_ENABLED=false to opt out
-		// entirely (skips OG discovery and any future Gwell work).
-		GwellEnabled:        envBool("GWELL_ENABLED", true),
+		// internal/wyzeapi/models.go IsWebRTCStreamer. Disabled by
+		// default because the standard runtime image does not include
+		// gwell-proxy. Set GWELL_ENABLED=true and provide a compatible
+		// binary with GWELL_BINARY to enable OG-camera streaming.
+		GwellEnabled:        envBool("GWELL_ENABLED", false),
 		GwellBinary:         env("GWELL_BINARY", ""),
 		GwellRTSPPort:       envInt("GWELL_RTSP_PORT", 8564),
 		GwellControlPort:    envInt("GWELL_CONTROL_PORT", 18564),

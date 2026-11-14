@@ -29,14 +29,10 @@ RUN CGO_ENABLED=0 GOOS=linux \
 
 # ── Stage 3: Runtime ──────────────────────────────────────────────────────────
 FROM alpine:3.21
-# ffmpeg is used by two things in this image:
+# ffmpeg is used by:
 #   1. go2rtc's /api/frame.jpeg snapshot endpoint (JPEG frame extraction)
-#   2. the optional gwell-proxy sidecar, which spawns an ffmpeg subprocess
-#      per GW_* camera to RTSP-PUSH H.264 into go2rtc's RTSP server.
-# Alpine's ffmpeg package adds ~40 MB, bringing the total image to ~60–65 MB
-# (still well under the 200+ MB Python bridge). If you have no GW_* cameras
-# AND don't need JPEG snapshots, you could omit ffmpeg and everything else
-# (RTSP/HLS/WebRTC playback) keeps working.
+#   2. the recording subsystem (per-camera recording processes)
+# Keep ffmpeg installed when snapshots or recording are required.
 RUN apk add --no-cache ca-certificates tzdata ffmpeg && \
     mkdir -p /config /media/snapshots /media/recordings
 

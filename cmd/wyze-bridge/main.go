@@ -40,6 +40,8 @@ func main() {
 	// Initialize logging
 	initLogging(cfg)
 
+	configureGwellProxy(cfg, log.Logger)
+
 	log.Info().
 		Str("version", Version).
 		Str("log_level", cfg.LogLevel.String()).
@@ -270,7 +272,7 @@ type gwellProxyHandle struct {
 
 func startGwellProxyIfEnabled(ctx context.Context, cfg *config.Config, camMgr *camera.Manager) *gwellProxyHandle {
 	if !cfg.GwellEnabled {
-		log.Info().Msg("GWELL_ENABLED=false; GW_ cameras will be skipped")
+		log.Info().Msg("Gwell streaming disabled; OG Gwell cameras will be skipped")
 		return nil
 	}
 	// Only spawn if there's at least one OG-style Gwell camera (IsGwell

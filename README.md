@@ -76,11 +76,11 @@ configure the path, the bridge routes based on the model.
 
 - **TUTK** — go2rtc's built-in `wyze://` source. Direct LAN P2P (or
   cloud-relayed P2P if the camera is remote) for most of the fleet.
-- **Gwell P2P** — `gwell-proxy` sidecar handles Wyze's newer
-  Gwell/IoTVideo LAN-direct UDP protocol. Enabled by default (set
-  `GWELL_ENABLED=false` to opt out); the sidecar only actually spawns
-  when an OG-family camera is discovered, so users without OG cameras
-  pay zero cost.
+- **Gwell P2P** — optional `gwell-proxy` handles Wyze's newer
+  Gwell/IoTVideo LAN-direct UDP protocol for OG-family cameras. Disabled
+  by default because the standard image does not include the proxy.
+  Enable with `GWELL_ENABLED=true` and provide a compatible executable
+  via `GWELL_BINARY` or `PATH`; OG cameras are skipped if unavailable.
 - **WebRTC (KVS)** — go2rtc's native `#format=wyze` handler dials
   Wyze's `wyze-mars-webcsrv.wyzecam.com` signaling server itself and
   speaks AWS-KVS WebRTC. Used by doorbell-lineage hardware that skips
