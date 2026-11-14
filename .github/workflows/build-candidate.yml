@@ -9,6 +9,10 @@ on:
       version:
         required: true
         type: string
+      source_sha:
+        required: false
+        type: string
+        default: ""
     outputs:
       archive_sha256:
         value: ${{ jobs.build.outputs.archive_sha256 }}
@@ -32,11 +36,13 @@ jobs:
         env:
           ARCH: ${{ inputs.arch }}
           VERSION: ${{ inputs.version }}
+          SOURCE_SHA: ${{ inputs.source_sha }}
         run: |
           set -euo pipefail
           if [[ "$ARCH" != amd64 && "$ARCH" != arm64 ]] ||
-             [[ ${#VERSION} -gt 64 || ! $VERSION =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
-            echo "::error::Invalid candidate architecture or version"
+             [[ ${#VERSION} -gt 64 || ! $VERSION =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]] ||
+             [[ -n "$SOURCE_SHA" && ! "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::Invalid candidate architecture, version, or source SHA"
             exit 1
           fi
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
@@ -44,11 +50,17 @@ jobs:
           ref: ${{ github.sha }}
           persist-credentials: false
       - uses: ./.github/actions/setup-buildx
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        if: inputs.source_sha != ''
+        with:
+          ref: ${{ inputs.source_sha }}
+          path: candidate-source
+          persist-credentials: false
       - name: Build candidate OCI archive
         uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
         with:
-          context: .
-          file: docker/Dockerfile
+          context: ${{ inputs.source_sha != '' && './candidate-source' || '.' }}
+          file: ${{ inputs.source_sha != '' && './candidate-source/docker/Dockerfile' || 'docker/Dockerfile' }}
           platforms: linux/${{ inputs.arch }}
           build-args: VERSION=${{ inputs.version }}
           outputs: type=oci,dest=${{ runner.temp }}/image.tar

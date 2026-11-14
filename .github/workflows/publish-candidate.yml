@@ -1,0 +1,229 @@
+name: Publish test candidate
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_ref:
+        description: Branch or commit to build
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-24.04
+    outputs:
+      source_sha: ${{ steps.source.outputs.source_sha }}
+    steps:
+      - name: Resolve candidate source
+        id: source
+        env:
+          SOURCE_REF: ${{ inputs.source_ref }}
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "$GITHUB_REPOSITORY" != "hermanops/docker-wyze-bridge" || "$GITHUB_REF" != "refs/heads/main" ]]; then
+            echo "::error::Dispatch the trusted candidate workflow from main"
+            exit 1
+          fi
+          if [[ -z "$SOURCE_REF" || ${#SOURCE_REF} -gt 255 || "$SOURCE_REF" == *$'\n'* || "$SOURCE_REF" == *$'\r'* ]]; then
+            echo "::error::Invalid source ref"
+            exit 1
+          fi
+          encoded=$(jq -rn --arg ref "$SOURCE_REF" '$ref | @uri')
+          source_sha=$(gh api "repos/$GITHUB_REPOSITORY/commits/$encoded" --jq .sha)
+          if [[ ! "$source_sha" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::Could not resolve source to a commit SHA"
+            exit 1
+          fi
+          echo "source_sha=$source_sha" >> "$GITHUB_OUTPUT"
+
+  build-amd64:
+    needs: validate
+    uses: ./.github/workflows/build-candidate.yml
+    permissions:
+      contents: read
+    with:
+      arch: amd64
+      version: 0.0.0
+      source_sha: ${{ needs.validate.outputs.source_sha }}
+
+  build-arm64:
+    needs: validate
+    uses: ./.github/workflows/build-candidate.yml
+    permissions:
+      contents: read
+    with:
+      arch: arm64
+      version: 0.0.0
+      source_sha: ${{ needs.validate.outputs.source_sha }}
+
+  publish:
+    needs: [validate, build-amd64, build-arm64]
+    runs-on: ubuntu-24.04
+    concurrency:
+      group: ghcr-candidate-${{ github.repository }}
+      cancel-in-progress: false
+    permissions:
+      actions: read
+      contents: read
+      packages: write
+    env:
+      SKOPEO_IMAGE: quay.io/skopeo/stable:v1.20.0@sha256:47853bb9fb24202af9110531ebd6e43c5f97701254ca290596640290d17942f4
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: candidate-*
+          path: ${{ runner.temp }}/candidates
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: sbom-amd64
+          path: ${{ runner.temp }}/sboms/amd64
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: sbom-arm64
+          path: ${{ runner.temp }}/sboms/arm64
+      - name: Verify scanned artifacts
+        env:
+          AMD64_ARCHIVE: ${{ needs.build-amd64.outputs.archive_sha256 }}
+          ARM64_ARCHIVE: ${{ needs.build-arm64.outputs.archive_sha256 }}
+          AMD64_SBOM: ${{ needs.build-amd64.outputs.sbom_sha256 }}
+          ARM64_SBOM: ${{ needs.build-arm64.outputs.sbom_sha256 }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$AMD64_ARCHIVE" =~ ^[0-9a-f]{64}$ && "$ARM64_ARCHIVE" =~ ^[0-9a-f]{64}$ ]]
+          printf '%s  %s\n' "$AMD64_ARCHIVE" "$RUNNER_TEMP/candidates/candidate-amd64/image.tar" | sha256sum -c -
+          printf '%s  %s\n' "$ARM64_ARCHIVE" "$RUNNER_TEMP/candidates/candidate-arm64/image.tar" | sha256sum -c -
+          for arch in amd64 arm64; do
+            if [[ "$arch" == amd64 ]]; then sbom_sha=$AMD64_SBOM; else sbom_sha=$ARM64_SBOM; fi
+            sbom="$RUNNER_TEMP/sboms/$arch/sbom-$arch.cdx.json"
+            if [[ ! "$sbom_sha" =~ ^[0-9a-f]{64}$ || ! -f "$sbom" || ! -s "$sbom" ]]; then
+              echo "::error::Missing, empty, or invalid scanned SBOM for $arch"
+              exit 1
+            fi
+            printf '%s  %s\n' "$sbom_sha" "$sbom" | sha256sum -c -
+          done
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: ./.github/actions/setup-buildx
+      - name: Pull pinned Skopeo
+        run: docker pull "$SKOPEO_IMAGE"
+      - name: Login to GHCR
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ github.token }}
+      - name: Publish scanned candidate manifests
+        id: publish
+        env:
+          SOURCE_SHA: ${{ needs.validate.outputs.source_sha }}
+          AMD64_MANIFEST: ${{ needs.build-amd64.outputs.manifest_digest }}
+          ARM64_MANIFEST: ${{ needs.build-arm64.outputs.manifest_digest }}
+          GHCR_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ ! "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ || ! "$GITHUB_RUN_ID" =~ ^[0-9]+$ || ! "$GITHUB_RUN_ATTEMPT" =~ ^[0-9]+$ ]] ||
+             [[ ! "$AMD64_MANIFEST" =~ ^sha256:[0-9a-f]{64}$ || ! "$ARM64_MANIFEST" =~ ^sha256:[0-9a-f]{64}$ ]] ||
+             [[ "$GITHUB_REPOSITORY" != "hermanops/docker-wyze-bridge" || "$GITHUB_REPOSITORY_OWNER" != "hermanops" || ! "$GHCR_TOKEN" =~ ^[A-Za-z0-9._-]+$ ]]; then
+            echo "::error::Invalid candidate publication inputs"
+            exit 1
+          fi
+          image=ghcr.io/hermanops/docker-wyze-bridge
+          tag="candidate-${SOURCE_SHA:0:12}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          registry_token=$(printf 'user = "%s:%s"\n' "$GITHUB_REPOSITORY_OWNER" "$GHCR_TOKEN" |
+            curl --disable --config - --silent --show-error --fail --get \
+              --connect-timeout 10 --max-time 60 \
+              --data-urlencode "service=ghcr.io" \
+              --data-urlencode "scope=repository:$GITHUB_REPOSITORY:pull" \
+              https://ghcr.io/token |
+            jq -ers 'select(length == 1) | .[0] | select(type == "object") |
+              (.token // .access_token) | select(type == "string" and test("^[A-Za-z0-9._~+/=-]+$"))') || {
+              echo "::error::Could not authenticate to GHCR"
+              exit 1
+            }
+          registry_get() {
+            printf 'header = "Authorization: Bearer %s"\n' "$registry_token" |
+              curl --disable --config - --silent --show-error \
+                --connect-timeout 10 --max-time 60 --max-filesize 4194304 \
+                --header 'Accept: application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.list.v2+json, application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.v2+json' \
+                --output "$RUNNER_TEMP/ghcr-response.json" --write-out '%{http_code}' \
+                "https://ghcr.io/v2/$GITHUB_REPOSITORY/$1"
+          }
+          status=$(registry_get 'tags/list?n=1') || {
+            echo "::error::Could not verify access to the GHCR package"
+            exit 1
+          }
+          if [[ "$status" != 200 ]] ||
+             ! jq -es --arg name "$GITHUB_REPOSITORY" 'length == 1 and (.[0] | type == "object" and .name == $name and (.tags == null or (.tags | type == "array")))' "$RUNNER_TEMP/ghcr-response.json" >/dev/null; then
+            echo "::error::Could not verify access to the GHCR package (HTTP $status)"
+            exit 1
+          fi
+          require_missing_tag() {
+            status=$(registry_get "manifests/$1") || {
+              echo "::error::Could not check candidate tag $1"
+              exit 1
+            }
+            if [[ "$status" != 404 ]] ||
+               ! jq -es 'length == 1 and (.[0] | type == "object" and
+                 (.errors | type == "array" and length == 1) and .errors[0].code == "MANIFEST_UNKNOWN")' \
+                 "$RUNNER_TEMP/ghcr-response.json" >/dev/null; then
+              echo "::error::Candidate tag $1 is not confirmed missing (HTTP $status)"
+              exit 1
+            fi
+          }
+          for candidate_tag in "$tag" "$tag-amd64" "$tag-arm64"; do
+            require_missing_tag "$candidate_tag"
+          done
+          for arch in amd64 arm64; do
+            if [[ "$arch" == amd64 ]]; then manifest=$AMD64_MANIFEST; else manifest=$ARM64_MANIFEST; fi
+            require_missing_tag "$tag-$arch"
+            docker run --rm \
+              -v "$RUNNER_TEMP/candidates:/images:ro" \
+              -v "$HOME/.docker/config.json:/auth.json:ro" \
+              "$SKOPEO_IMAGE" copy --preserve-digests --authfile /auth.json \
+              "oci-archive:/images/candidate-$arch/image.tar" "docker://$image:$tag-$arch"
+            actual=$(docker run --rm \
+              -v "$HOME/.docker/config.json:/auth.json:ro" \
+              "$SKOPEO_IMAGE" inspect --raw --authfile /auth.json \
+              "docker://$image@$manifest" | sha256sum | cut -d ' ' -f 1)
+            if [[ "sha256:$actual" != "$manifest" ]]; then
+              echo "::error::Published $arch manifest does not match the scanned digest"
+              exit 1
+            fi
+          done
+          require_missing_tag "$tag"
+          docker buildx imagetools create --tag "$image:$tag" \
+            "$image@$AMD64_MANIFEST" "$image@$ARM64_MANIFEST"
+          echo "image=$image:$tag" >> "$GITHUB_OUTPUT"
+      - name: Verify candidate index
+        env:
+          IMAGE: ${{ steps.publish.outputs.image }}
+          AMD64_MANIFEST: ${{ needs.build-amd64.outputs.manifest_digest }}
+          ARM64_MANIFEST: ${{ needs.build-arm64.outputs.manifest_digest }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if ! docker run --rm \
+            -v "$HOME/.docker/config.json:/auth.json:ro" \
+            "$SKOPEO_IMAGE" inspect --raw --authfile /auth.json "docker://$IMAGE" |
+            jq -e --arg amd64 "$AMD64_MANIFEST" --arg arm64 "$ARM64_MANIFEST" '
+              .schemaVersion == 2 and
+              (.mediaType == "application/vnd.oci.image.index.v1+json" or
+               .mediaType == "application/vnd.docker.distribution.manifest.list.v2+json") and
+              (.manifests | type == "array" and length == 2) and
+              ([.manifests[] | {os: .platform.os, arch: .platform.architecture, digest}] | sort_by(.arch)) ==
+              ([{os: "linux", arch: "amd64", digest: $amd64},
+                {os: "linux", arch: "arm64", digest: $arm64}] | sort_by(.arch))
+            ' >/dev/null; then
+            echo "::error::Published candidate index does not match the scanned manifests"
+            exit 1
+          fi
+          printf 'Candidate image: `%s`\n\nPull: `docker pull %s`\n' "$IMAGE" "$IMAGE" >> "$GITHUB_STEP_SUMMARY"
