@@ -91,15 +91,34 @@ jobs:
         with:
           pattern: candidate-*
           path: ${{ runner.temp }}/candidates
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: sbom-amd64
+          path: ${{ runner.temp }}/sboms/amd64
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: sbom-arm64
+          path: ${{ runner.temp }}/sboms/arm64
       - name: Verify scanned artifacts
         env:
           AMD64_ARCHIVE: ${{ needs.build-amd64.outputs.archive_sha256 }}
           ARM64_ARCHIVE: ${{ needs.build-arm64.outputs.archive_sha256 }}
+          AMD64_SBOM: ${{ needs.build-amd64.outputs.sbom_sha256 }}
+          ARM64_SBOM: ${{ needs.build-arm64.outputs.sbom_sha256 }}
         run: |
           set -euo pipefail
           [[ "$AMD64_ARCHIVE" =~ ^[0-9a-f]{64}$ && "$ARM64_ARCHIVE" =~ ^[0-9a-f]{64}$ ]]
           printf '%s  %s\n' "$AMD64_ARCHIVE" "$RUNNER_TEMP/candidates/candidate-amd64/image.tar" | sha256sum -c -
           printf '%s  %s\n' "$ARM64_ARCHIVE" "$RUNNER_TEMP/candidates/candidate-arm64/image.tar" | sha256sum -c -
+          for arch in amd64 arm64; do
+            if [[ "$arch" == amd64 ]]; then sbom_sha=$AMD64_SBOM; else sbom_sha=$ARM64_SBOM; fi
+            sbom="$RUNNER_TEMP/sboms/$arch/sbom-$arch.cdx.json"
+            if [[ ! "$sbom_sha" =~ ^[0-9a-f]{64}$ || ! -f "$sbom" || ! -s "$sbom" ]]; then
+              echo "::error::Missing, empty, or invalid scanned SBOM for $arch"
+              exit 1
+            fi
+            printf '%s  %s\n' "$sbom_sha" "$sbom" | sha256sum -c -
+          done
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           ref: ${{ github.sha }}

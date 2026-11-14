@@ -14,6 +14,8 @@ on:
         value: ${{ jobs.build.outputs.archive_sha256 }}
       manifest_digest:
         value: ${{ jobs.build.outputs.manifest_digest }}
+      sbom_sha256:
+        value: ${{ jobs.build.outputs.sbom_sha256 }}
 
 permissions:
   contents: read
@@ -24,6 +26,7 @@ jobs:
     outputs:
       archive_sha256: ${{ steps.scan.outputs.archive_sha256 }}
       manifest_digest: ${{ steps.scan.outputs.manifest_digest }}
+      sbom_sha256: ${{ steps.scan.outputs.sbom_sha256 }}
     steps:
       - name: Validate inputs
         env:
@@ -65,6 +68,20 @@ jobs:
           curl -fsSL --retry 3 "https://github.com/aquasecurity/trivy/releases/download/v0.69.3/trivy_0.69.3_${asset}.tar.gz" -o "$RUNNER_TEMP/trivy.tar.gz"
           echo "$digest  $RUNNER_TEMP/trivy.tar.gz" | sha256sum -c -
           tar -xzf "$RUNNER_TEMP/trivy.tar.gz" -C "$RUNNER_TEMP" trivy
+      - name: Install verified CycloneDX CLI
+        env:
+          ARCH: ${{ inputs.arch }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          case "$ARCH" in
+            amd64) asset=cyclonedx-linux-x64; digest=6c5ed6321ee3bb3c268b6d19477dbcd5509a757f118bed4b6508fe9fbbdc2a5b ;;
+            arm64) asset=cyclonedx-linux-arm64; digest=2fe04169f663935ad8510ca3dfbec68f9ab2eb0136918abd00bc454ec20cbeaf ;;
+            *) exit 1 ;;
+          esac
+          curl -fsSL --retry 3 "https://github.com/CycloneDX/cyclonedx-cli/releases/download/v0.29.2/$asset" -o "$RUNNER_TEMP/cyclonedx"
+          echo "$digest  $RUNNER_TEMP/cyclonedx" | sha256sum -c -
+          chmod +x "$RUNNER_TEMP/cyclonedx"
       - name: Generate SBOM and scan candidate
         id: scan
         env:
@@ -84,17 +101,26 @@ jobs:
             else error("invalid candidate manifest") end' oci/index.json)
           printf '%s  %s\n' "${manifest#sha256:}" "oci/blobs/sha256/${manifest#sha256:}" | sha256sum -c -
           ./trivy image --input oci --format cyclonedx --output "sbom-$ARCH.cdx.json"
+          if [[ ! -f "sbom-$ARCH.cdx.json" || ! -s "sbom-$ARCH.cdx.json" ]] ||
+             ! jq -es 'length == 1 and (.[0] | type == "object" and .bomFormat == "CycloneDX")' "sbom-$ARCH.cdx.json" >/dev/null; then
+            echo "::error::Trivy did not produce a nonempty CycloneDX SBOM for $ARCH"
+            exit 1
+          fi
+          DOTNET_SYSTEM_GLOBALIZATION_INVARIANT=1 ./cyclonedx validate \
+            --input-file "sbom-$ARCH.cdx.json" --input-format json --input-version v1_6 --fail-on-errors
+          sbom_sha=$(sha256sum "sbom-$ARCH.cdx.json" | cut -d ' ' -f 1)
           ./trivy image --input oci --scanners vuln --severity CRITICAL --exit-code 1 --ignorefile /dev/null
           printf '%s  image.tar\n' "$archive_sha" | sha256sum -c -
+          printf '%s  %s\n' "$sbom_sha" "sbom-$ARCH.cdx.json" | sha256sum -c -
           echo "archive_sha256=$archive_sha" >> "$GITHUB_OUTPUT"
           echo "manifest_digest=$manifest" >> "$GITHUB_OUTPUT"
+          echo "sbom_sha256=$sbom_sha" >> "$GITHUB_OUTPUT"
       - name: Upload SBOM
-        if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: sbom-${{ inputs.arch }}
           path: ${{ runner.temp }}/sbom-${{ inputs.arch }}.cdx.json
-          if-no-files-found: warn
+          if-no-files-found: error
           retention-days: 30
       - name: Upload scanned OCI archive
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4

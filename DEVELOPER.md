@@ -173,9 +173,17 @@ token restrictions still apply.
 Publishing is a separate, manual workflow. **Before enabling Actions or
 dispatching it**, configure these repository settings:
 
-1. Protect `main` with required PR reviews and CI checks, restrict who can
-   change workflows, and prevent administrators and automation from bypassing
-   those rules where available. `main` is currently unprotected.
+1. Protect `main` with a GitHub branch ruleset or classic branch protection.
+   For a classic rule, use **Settings > Branches > Add classic branch
+   protection rule**. Set the branch name pattern to `main` and enable
+   **Require a pull request before merging**, leaving **Require approvals**
+   unchecked for the sole operator. Enable **Require status checks to pass
+   before merging**, select the GitHub Actions checks `test` and `image`,
+   and enable **Require branches to be up to date before merging**. Enable
+   **Do not allow bypassing the above settings**; leave **Allow force pushes**
+   and **Allow deletions** unchecked. Save the rule. If the checks do not
+   appear, they must first run on a pull request; do not select similarly named
+   checks from another source. Restrict who can change workflows and settings.
 2. Create the `production` environment and restrict its deployment branches to
    `main`. The sole release operator authorizes releases by manually dispatching
    the workflow; independent reviewer approval is not required. GitHub may
@@ -195,15 +203,22 @@ dispatching it**, configure these repository settings:
    explicitly. No `dev` branch is needed.
 
 After these settings are in place and the workflows are reviewed and enabled,
-dispatch **Publish bridge image** from the current `main` with a numeric
+confirm that the repository can use both hosted runner architectures and that
+the publish job's `GITHUB_TOKEN` can write the GHCR package. Then dispatch
+**Publish bridge image** from the current `main` with a numeric
 `MAJOR.MINOR.PATCH` version. It builds amd64 and arm64 separately, produces a
 CycloneDX SBOM for each, and blocks on any CRITICAL vulnerability, including
 unfixed findings. The build jobs pass the archive SHA-256 and OCI manifest
-digest as workflow outputs only after the scan succeeds. After both scans
-succeed, the publish job verifies the downloaded archive hashes, copies the
-exact OCI manifests using Skopeo's `--preserve-digests`, verifies the registry
-digests, and creates the multi-architecture version tag in GHCR. It then
-inspects the index and fails unless it contains exactly the scanned
+digest and SBOM SHA-256 as workflow outputs only after the scan succeeds. Each
+SBOM must be nonempty JSON and pass CycloneDX 1.6 schema validation using the
+checksum-verified CycloneDX CLI; its upload must succeed. After both scans
+succeed, the publish job downloads both SBOMs and verifies their hashes against
+the corresponding candidate jobs, as well as the archive hashes. Missing,
+empty, unavailable, or mismatched SBOM artifacts or checksums stop publication
+before any GHCR write. It copies the exact OCI manifests using Skopeo's
+`--preserve-digests`, verifies the registry digests, and creates the
+multi-architecture version tag in GHCR. It then inspects the index and fails
+unless it contains exactly the scanned
 linux/amd64 and linux/arm64 manifest digests. The index itself is assembled
 from the scanned manifests; it is not separately scanned. The job does not
 rebuild images. Per-run architecture tags are also pushed; a failure can
