@@ -493,16 +493,20 @@ func TestPublishCandidateManifests(t *testing.T) {
 	amdSum, armSum := sha256.Sum256(amd), sha256.Sum256(arm)
 	amdDigest, armDigest := "sha256:"+hex.EncodeToString(amdSum[:]), "sha256:"+hex.EncodeToString(armSum[:])
 	sha := strings.Repeat("a", 40)
-	tag := "candidate-aaaaaaaaaaaa-123-1"
-	for _, scenario := range []string{"valid", "existing-index", "existing-amd64", "existing-arm64",
-		"missing-package", "package-forbidden", "wrong-package", "package-network-error",
-		"unauthorized", "bad-response", "auth-failure", "tampered-manifest"} {
+	tag := "candidate-aaaaaaaaaaaa-123-1-" + strings.Repeat("b", 32)
+	for _, scenario := range []string{"existing-package", "first-publication", "first-name-unknown", "first-collision", "first-write-denied",
+		"first-post-write-forbidden", "existing-index", "existing-amd64", "existing-arm64",
+		"ambiguous-package-404", "package-forbidden", "wrong-package", "package-network-error",
+		"unauthorized", "bad-response", "auth-failure", "tampered-manifest", "invalid-nonce"} {
 		t.Run(scenario, func(t *testing.T) {
 			dir := t.TempDir()
 			dockerStub := `#!/bin/sh
 printf '%s\n' "$*" >> "$TEST_CALLS"
 case "$*" in
-  *" copy --preserve-digests "*) exit 0 ;;
+  *" copy --preserve-digests "*)
+    [ "$TEST_CASE" != first-write-denied ] || exit 1
+    : > "$TEST_PACKAGE_CREATED"
+    exit 0 ;;
   *" inspect --raw "*)
     for last do :; done
     case "$last" in
@@ -525,39 +529,66 @@ for arg do
   esac
 done
 config=$(cat)
+expected='header = "Authorization: Bearer mock-registry-token"'
+if [ "$TEST_CASE" = first-publication ] && [ -f "$TEST_PACKAGE_CREATED" ]; then
+  expected='header = "Authorization: Bearer refreshed-registry-token"'
+fi
 case "$url" in
   https://ghcr.io/token)
     [ "$config" = 'user = "hermanops:mock-token"' ] || exit 1
     [ "$TEST_CASE" != auth-failure ] || exit 7
-    printf '%s' '{"token":"mock-registry-token"}' ;;
+    if [ "$TEST_CASE" = first-publication ] && [ -f "$TEST_PACKAGE_CREATED" ]; then
+      printf '%s' '{"token":"refreshed-registry-token"}'
+    else
+      printf '%s' '{"token":"mock-registry-token"}'
+    fi ;;
   "https://ghcr.io/v2/hermanops/docker-wyze-bridge/tags/list?n=1")
-    [ "$config" = 'header = "Authorization: Bearer mock-registry-token"' ] || exit 1
+    [ "$config" = "$expected" ] || exit 1
     case "$TEST_CASE" in
-      missing-package) printf '%s' '{}' > "$output"; printf 404 ;;
+      first-publication|first-name-unknown|first-collision|first-write-denied|first-post-write-forbidden)
+        if [ ! -f "$TEST_PACKAGE_CREATED" ]; then
+          printf '%s' '{"errors":[{"code":"NAME_UNKNOWN"}]}' > "$output"; printf 404
+        elif [ "$TEST_CASE" = first-post-write-forbidden ]; then
+          printf '%s' '{}' > "$output"; printf 403
+        else
+          printf '%s' '{"name":"hermanops/docker-wyze-bridge","tags":[]}' > "$output"; printf 200
+        fi ;;
+      ambiguous-package-404) printf '%s' '{}' > "$output"; printf 404 ;;
       package-forbidden) printf '%s' '{}' > "$output"; printf 403 ;;
       wrong-package) printf '%s' '{"name":"other/package","tags":[]}' > "$output"; printf 200 ;;
       package-network-error) exit 7 ;;
       *) printf '%s' '{"name":"hermanops/docker-wyze-bridge","tags":[]}' > "$output"; printf 200 ;;
     esac ;;
   https://ghcr.io/v2/hermanops/docker-wyze-bridge/manifests/*)
-    [ "$config" = 'header = "Authorization: Bearer mock-registry-token"' ] || exit 1
+    [ "$config" = "$expected" ] || exit 1
     tag=${url##*/}
     case "$TEST_CASE:$tag" in
       existing-index:"$TEST_TAG"|existing-amd64:"$TEST_TAG-amd64"|existing-arm64:"$TEST_TAG-arm64")
         printf '%s' '{}' > "$output"; printf 200 ;;
+      first-collision:"$TEST_TAG-amd64") printf '%s' '{}' > "$output"; printf 200 ;;
       unauthorized:*) printf '%s' '{}' > "$output"; printf 401 ;;
       bad-response:*) printf '%s' '{"errors":[{"code":"NAME_UNKNOWN"}]}' > "$output"; printf 404 ;;
+      first-name-unknown:*)
+        if [ ! -f "$TEST_PACKAGE_CREATED" ]; then
+          printf '%s' '{"errors":[{"code":"NAME_UNKNOWN"}]}' > "$output"; printf 404
+        else
+          printf '%s' '{"errors":[{"code":"MANIFEST_UNKNOWN"}]}' > "$output"; printf 404
+        fi ;;
       *) printf '%s' '{"errors":[{"code":"MANIFEST_UNKNOWN"}]}' > "$output"; printf 404 ;;
     esac ;;
   *) exit 1 ;;
 esac
+`
+			opensslStub := `#!/bin/sh
+[ "$*" = "rand -hex 16" ] || exit 1
+if [ "$TEST_CASE" = invalid-nonce ]; then printf '%s\n' invalid; else printf '%s\n' bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb; fi
 `
 			armContent := arm
 			if scenario == "tampered-manifest" {
 				armContent = []byte("tampered")
 			}
 			for name, content := range map[string][]byte{
-				"docker": []byte(dockerStub), "curl": []byte(curlStub),
+				"docker": []byte(dockerStub), "curl": []byte(curlStub), "openssl": []byte(opensslStub),
 				"amd64": amd, "arm64": armContent,
 			} {
 				if err := os.WriteFile(filepath.Join(dir, name), content, 0700); err != nil {
@@ -568,25 +599,33 @@ esac
 			err := runStep(publish, "PATH="+dir+string(os.PathListSeparator)+os.Getenv("PATH"),
 				"RUNNER_TEMP="+dir, "GITHUB_OUTPUT="+output, "TEST_CALLS="+calls,
 				"TEST_AMD64="+filepath.Join(dir, "amd64"), "TEST_ARM64="+filepath.Join(dir, "arm64"),
+				"TEST_PACKAGE_CREATED="+filepath.Join(dir, "package-created"),
 				"TEST_CASE="+scenario, "TEST_TAG="+tag, "SOURCE_SHA="+sha,
 				"GITHUB_REPOSITORY=hermanops/docker-wyze-bridge", "GITHUB_REPOSITORY_OWNER=hermanops",
 				"GITHUB_RUN_ID=123", "GITHUB_RUN_ATTEMPT=1", "GHCR_TOKEN=mock-token", "SKOPEO_IMAGE=skopeo",
 				"AMD64_MANIFEST="+amdDigest, "ARM64_MANIFEST="+armDigest)
-			if (err == nil) != (scenario == "valid") {
+			success := scenario == "existing-package" || scenario == "first-publication" || scenario == "first-name-unknown"
+			if (err == nil) != success {
 				t.Fatalf("publication success = %t for %s: %v", err == nil, scenario, err)
 			}
 			log, readErr := os.ReadFile(calls)
 			if readErr != nil && !os.IsNotExist(readErr) {
 				t.Fatal(readErr)
 			}
-			if scenario != "valid" && scenario != "tampered-manifest" && len(log) != 0 {
+			if !success && scenario != "tampered-manifest" && scenario != "first-write-denied" &&
+				scenario != "first-post-write-forbidden" && len(log) != 0 {
 				t.Fatalf("registry writes before preflight success: %s", log)
 			}
 			indexCommand := "buildx imagetools create --tag ghcr.io/hermanops/docker-wyze-bridge:" + tag
-			if strings.Contains(string(log), indexCommand) != (scenario == "valid") {
+			if strings.Contains(string(log), indexCommand) != success {
 				t.Fatalf("unexpected index publication: %s", log)
 			}
-			if scenario == "valid" {
+			if scenario == "first-write-denied" || scenario == "first-post-write-forbidden" {
+				if strings.Count(string(log), " copy --preserve-digests ") != 1 {
+					t.Fatalf("unexpected writes after first push: %s", log)
+				}
+			}
+			if success {
 				data, err := os.ReadFile(output)
 				if err != nil || string(data) != "image=ghcr.io/hermanops/docker-wyze-bridge:"+tag+"\n" {
 					t.Fatalf("unexpected output %q: %v", data, err)

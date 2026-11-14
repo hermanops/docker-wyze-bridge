@@ -181,13 +181,14 @@ checksum, and CRITICAL scan gates as production. Candidate builds embed
 
 After both builds pass, the publish job verifies their archives and SBOMs and
 promotes the scanned manifests without rebuilding. Its run summary gives the
-exact `ghcr.io/hermanops/docker-wyze-bridge:candidate-<sha>-<run>-<attempt>`
+exact `ghcr.io/hermanops/docker-wyze-bridge:candidate-<sha>-<run>-<attempt>-<nonce>`
 reference and pull command after the multi-architecture index is verified.
-The package must already be accessible to the job's `GITHUB_TOKEN` with
-package write permission. The preflight requires an authenticated package
-listing; a 404 does not establish that the package is absent, and a successful
-listing does not prove write access. Private packages require GHCR
-authentication on the homelab.
+The job's `GITHUB_TOKEN` needs package write permission. A first candidate
+push can create the package: an authenticated `NAME_UNKNOWN` response does not
+prove that it is absent or inaccessible, so the workflow uses a random tag
+suffix and requires package access after the first write. A successful listing
+does not prove write access. Private packages require GHCR authentication on
+the homelab.
 
 Automatic cleanup is not implemented. Candidate and per-architecture tags may
 remain after a failed run. GHCR package-version deletion can remove other tags
@@ -204,7 +205,7 @@ and media directories, substituting the verified image from the run summary:
 ```yaml
 services:
   candidate:
-    image: ghcr.io/hermanops/docker-wyze-bridge:candidate-<sha>-<run>-<attempt>
+    image: ghcr.io/hermanops/docker-wyze-bridge:candidate-<sha>-<run>-<attempt>-<nonce>
     env_file: ./candidate.env
     ports:
       - "15080:5080"

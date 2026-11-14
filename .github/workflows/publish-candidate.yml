@@ -137,18 +137,26 @@ jobs:
             exit 1
           fi
           image=ghcr.io/hermanops/docker-wyze-bridge
-          tag="candidate-${SOURCE_SHA:0:12}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
-          registry_token=$(printf 'user = "%s:%s"\n' "$GITHUB_REPOSITORY_OWNER" "$GHCR_TOKEN" |
-            curl --disable --config - --silent --show-error --fail --get \
-              --connect-timeout 10 --max-time 60 \
-              --data-urlencode "service=ghcr.io" \
-              --data-urlencode "scope=repository:$GITHUB_REPOSITORY:pull" \
-              https://ghcr.io/token |
-            jq -ers 'select(length == 1) | .[0] | select(type == "object") |
-              (.token // .access_token) | select(type == "string" and test("^[A-Za-z0-9._~+/=-]+$"))') || {
-              echo "::error::Could not authenticate to GHCR"
-              exit 1
-            }
+          nonce=$(openssl rand -hex 16)
+          if [[ ! "$nonce" =~ ^[0-9a-f]{32}$ ]]; then
+            echo "::error::Could not generate a unique candidate tag"
+            exit 1
+          fi
+          tag="candidate-${SOURCE_SHA:0:12}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${nonce}"
+          get_registry_token() {
+            registry_token=$(printf 'user = "%s:%s"\n' "$GITHUB_REPOSITORY_OWNER" "$GHCR_TOKEN" |
+              curl --disable --config - --silent --show-error --fail --get \
+                --connect-timeout 10 --max-time 60 \
+                --data-urlencode "service=ghcr.io" \
+                --data-urlencode "scope=repository:$GITHUB_REPOSITORY:pull" \
+                https://ghcr.io/token |
+              jq -ers 'select(length == 1) | .[0] | select(type == "object") |
+                (.token // .access_token) | select(type == "string" and test("^[A-Za-z0-9._~+/=-]+$"))')
+          }
+          get_registry_token || {
+            echo "::error::Could not authenticate to GHCR"
+            exit 1
+          }
           registry_get() {
             printf 'header = "Authorization: Bearer %s"\n' "$registry_token" |
               curl --disable --config - --silent --show-error \
@@ -157,12 +165,22 @@ jobs:
                 --output "$RUNNER_TEMP/ghcr-response.json" --write-out '%{http_code}' \
                 "https://ghcr.io/v2/$GITHUB_REPOSITORY/$1"
           }
-          status=$(registry_get 'tags/list?n=1') || {
-            echo "::error::Could not verify access to the GHCR package"
-            exit 1
+          check_package() {
+            status=$(registry_get 'tags/list?n=1') || return 1
+            [[ "$status" == 200 ]] &&
+              jq -es --arg name "$GITHUB_REPOSITORY" 'length == 1 and (.[0] | type == "object" and .name == $name and (.tags == null or (.tags | type == "array")))' "$RUNNER_TEMP/ghcr-response.json" >/dev/null
           }
-          if [[ "$status" != 200 ]] ||
-             ! jq -es --arg name "$GITHUB_REPOSITORY" 'length == 1 and (.[0] | type == "object" and .name == $name and (.tags == null or (.tags | type == "array")))' "$RUNNER_TEMP/ghcr-response.json" >/dev/null; then
+          error_code_is() {
+            jq -es --arg code "$1" 'length == 1 and (.[0] | type == "object" and
+              (.errors | type == "array" and length == 1) and .errors[0].code == $code)' \
+              "$RUNNER_TEMP/ghcr-response.json" >/dev/null
+          }
+          package_unknown=false
+          if check_package; then
+            :
+          elif [[ "$status" == 404 ]] && error_code_is NAME_UNKNOWN; then
+            package_unknown=true
+          else
             echo "::error::Could not verify access to the GHCR package (HTTP $status)"
             exit 1
           fi
@@ -172,9 +190,7 @@ jobs:
               exit 1
             }
             if [[ "$status" != 404 ]] ||
-               ! jq -es 'length == 1 and (.[0] | type == "object" and
-                 (.errors | type == "array" and length == 1) and .errors[0].code == "MANIFEST_UNKNOWN")' \
-                 "$RUNNER_TEMP/ghcr-response.json" >/dev/null; then
+               ! { error_code_is MANIFEST_UNKNOWN || { [[ "$package_unknown" == true ]] && error_code_is NAME_UNKNOWN; }; }; then
               echo "::error::Candidate tag $1 is not confirmed missing (HTTP $status)"
               exit 1
             fi
@@ -190,6 +206,13 @@ jobs:
               -v "$HOME/.docker/config.json:/auth.json:ro" \
               "$SKOPEO_IMAGE" copy --preserve-digests --authfile /auth.json \
               "oci-archive:/images/candidate-$arch/image.tar" "docker://$image:$tag-$arch"
+            if [[ "$package_unknown" == true ]]; then
+              get_registry_token && check_package || {
+                echo "::error::Could not verify package access after the first candidate write"
+                exit 1
+              }
+              package_unknown=false
+            fi
             actual=$(docker run --rm \
               -v "$HOME/.docker/config.json:/auth.json:ro" \
               "$SKOPEO_IMAGE" inspect --raw --authfile /auth.json \
