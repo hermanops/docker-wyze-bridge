@@ -1,8 +1,8 @@
 # Docker Wyze Bridge
 
-[![GitHub release (latest by date)](https://img.shields.io/github/v/release/idisposable/docker-wyze-bridge?logo=github)](https://github.com/idisposable/docker-wyze-bridge/releases/latest)
-[![GHCR Package](https://img.shields.io/badge/ghcr-package-blue?logo=github)](https://ghcr.io/idisposable/docker-wyze-bridge)
-[![Docker](https://github.com/IDisposable/docker-wyze-bridge/actions/workflows/docker-image.yml/badge.svg)](https://github.com/IDisposable/docker-wyze-bridge/actions/workflows/docker-image.yml)
+[![GitHub release (latest by date)](https://img.shields.io/github/v/release/hermanops/docker-wyze-bridge?logo=github)](https://github.com/hermanops/docker-wyze-bridge/releases/latest)
+[![GHCR Package](https://img.shields.io/badge/ghcr-package-blue?logo=github)](https://ghcr.io/hermanops/docker-wyze-bridge)
+[![Docker](https://github.com/hermanops/docker-wyze-bridge/actions/workflows/docker-image.yml/badge.svg)](https://github.com/hermanops/docker-wyze-bridge/actions/workflows/docker-image.yml)
 [![Home Assistant Add-on](https://img.shields.io/badge/home_assistant-add--on-blue.svg?logo=homeassistant&logoColor=white)](./docs/user_guide/install_ha.md)
 
 Local WebRTC / RTSP / HLS bridge for Wyze cameras. No modifications, no
@@ -116,13 +116,15 @@ reports welcome.
 
 ## Quick Start
 
+Replace `VERSION` with a published numeric release tag.
+
 ```bash
 docker run -p 5080:5080 -p 8554:8554 -p 8888:8888 -p 8889:8889 -p 8189:8189/udp \
   -e WYZE_EMAIL=you@example.com \
   -e WYZE_PASSWORD=yourpass \
   -e WYZE_API_ID=your-api-id \
   -e WYZE_API_KEY=your-api-key \
-  idisposablegithub365/wyze-bridge:go
+  ghcr.io/hermanops/docker-wyze-bridge:VERSION
 ```
 
 Then open `http://localhost:5080` for the WebUI.
@@ -132,7 +134,7 @@ Then open `http://localhost:5080` for the WebUI.
 ```yaml
 services:
   wyze-bridge:
-    image: idisposablegithub365/wyze-bridge:go
+    image: ghcr.io/hermanops/docker-wyze-bridge:VERSION
     restart: unless-stopped
     ports:
       - 5080:5080            # WebUI + REST API

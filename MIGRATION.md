@@ -5,13 +5,14 @@ This guide is for existing `docker-wyze-bridge` users upgrading from the Python-
 ## Quick Start
 
 Change your Docker image and you're done. All core environment variables are the same.
+Replace `VERSION` with a published numeric release tag.
 
 ```yaml
 # Before (Python)
-image: idisposablegithub365/wyze-bridge:latest
+image: <your-current-python-image>
 
 # After (Go rewrite)
-image: idisposablegithub365/wyze-bridge:go
+image: ghcr.io/hermanops/docker-wyze-bridge:VERSION
 ```
 
 ## What Works the Same
